@@ -9,7 +9,7 @@ from types import TracebackType
 
 import pytest
 
-from web_page import WebPage
+from web_page import FilePayload, WebPage
 
 type Call = tuple[str, ...]
 type WriteYaml = Callable[..., Path]
@@ -68,9 +68,22 @@ class FakeLocator:
         await asyncio.sleep(0)
         return None if name == "missing" else f"{name} of {self.selector}"
 
-    async def set_input_files(self, files: Sequence[str]) -> None:
+    async def set_input_files(
+        self, files: Sequence[str] | Sequence[FilePayload]
+    ) -> None:
         await asyncio.sleep(0)
-        self.calls.append(("set_input_files", self.selector, *files))
+        self.calls.append(
+            (
+                "set_input_files",
+                self.selector,
+                *(
+                    f
+                    if isinstance(f, str)
+                    else f"{f['name']} {f['mimeType']} {f['buffer']!r}"
+                    for f in files
+                ),
+            )
+        )
 
 
 @dataclass

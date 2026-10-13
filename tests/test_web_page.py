@@ -13,6 +13,7 @@ from web_page.exceptions import (
     BadActionParams,
     BadSelectorsFile,
     BadSelectorsName,
+    BytesParamNotAllowed,
     SelectorsAlreadyLoaded,
     SelectorsNotLoaded,
     UnknownSelectorKey,
@@ -311,3 +312,43 @@ async def test_accepts_path_objects(web_page: WebPage, tmp_path: Path) -> None:
     path = tmp_path / "s.yml"
     path.write_text("name: s\nselectors: {}\n", encoding="utf-8")
     await web_page.load_selectors(path)
+
+
+UPLOAD_SELECTORS = """    name: form
+    selectors:
+      docs: "#docs"
+    """
+
+UPLOAD_ACTION = """    name: attach
+    selectors_name: form
+    params: [blob, name, both]
+    steps:
+      - upload: {target: docs, files: [{data: blob, name: "{name}"}, {data: both, name: x}]}
+      - fill: {target: docs, value: "{both}"}
+    """
+
+
+async def test_run_accepts_bytes_only_for_data_params(
+    web_page: WebPage, fake_page: FakePage, write_yaml: WriteYaml
+) -> None:
+    await web_page.load_selectors(write_yaml("s.yaml", UPLOAD_SELECTORS))
+    await web_page.load_action(write_yaml("a.yaml", UPLOAD_ACTION))
+
+    for bad in ({"name": b"n"}, {"both": b"b"}):
+        params = {"blob": b"1", "name": "n", "both": "b", **bad}
+        with pytest.raises(BytesParamNotAllowed) as exc:
+            await web_page.run("attach", params)
+        assert exc.value.params == tuple(bad)
+        assert exc.value.allowed == ("blob",)
+    assert fake_page.calls == []
+
+    await web_page.run("attach", {"blob": b"1", "name": "n.txt", "both": "b"})
+    assert fake_page.calls == [
+        (
+            "set_input_files",
+            "#docs",
+            "n.txt text/plain b'1'",
+            "x application/octet-stream b'b'",
+        ),
+        ("fill", "#docs", "b"),
+    ]

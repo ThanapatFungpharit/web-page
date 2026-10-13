@@ -85,6 +85,19 @@ class BadActionParams(WebPageError):
         )
 
 
+class BytesParamNotAllowed(WebPageError):
+    def __init__(
+        self, action_name: str, params: Collection[str], allowed: Iterable[str]
+    ) -> None:
+        self.action_name = action_name
+        self.params = tuple(sorted(params))
+        self.allowed = tuple(sorted(allowed))
+        super().__init__(
+            f"Action {action_name!r} got bytes for params {list(self.params)}; only "
+            f"params used solely as upload data may be bytes: {list(self.allowed)}."
+        )
+
+
 class UnknownSelectorKey(WebPageError):
     def __init__(
         self,

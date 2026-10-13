@@ -10,6 +10,7 @@ from web_page.exceptions import (
     BadActionParams,
     BadSelectorsFile,
     BadSelectorsName,
+    BytesParamNotAllowed,
     SelectorsAlreadyLoaded,
     SelectorsNotLoaded,
     UnknownSelectorKey,
@@ -30,7 +31,7 @@ from web_page.types import (
     Selectors,
     SelectorsName,
 )
-from web_page.utils import is_str_dict
+from web_page.utils import is_str_dict, placeholders
 
 
 class WebPage:
@@ -76,10 +77,17 @@ class WebPage:
         )
         steps = parse_steps(require(manifest, "steps", BadActionFile, "Action"), params)
 
+        # A bytes value can't be formatted into text, so a param may be bytes only
+        # if no template uses it.
+        formatted = {
+            p for step in steps for t in step.templates for p in placeholders(t)
+        }
+        data = {p for step in steps for p in step.data_params}
         self._actions[name] = Action(
             selectors_name=tuple(selectors_name),
             params=tuple(params),
             steps=steps,
+            bytes_params=frozenset(data - formatted),
         )
 
     async def run(
@@ -103,6 +111,13 @@ class WebPage:
         extra = set(values) - set(action.params)
         if missing or extra:
             raise BadActionParams(action_name, action.params, missing, extra)
+        bad_bytes = {
+            name
+            for name, value in values.items()
+            if isinstance(value, bytes) and name not in action.bytes_params
+        }
+        if bad_bytes:
+            raise BytesParamNotAllowed(action_name, bad_bytes, action.bytes_params)
 
         # Later selector sets override earlier ones on key clashes.
         sel: dict[SelectorKey, CssSelector] = {}

@@ -10,7 +10,15 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Sequence
 from types import TracebackType
-from typing import Literal, Protocol
+from typing import Literal, Protocol, TypedDict
+
+
+class FilePayload(TypedDict):
+    """An in-memory file for ``set_input_files``, shaped like Playwright's."""
+
+    name: str
+    mimeType: str
+    buffer: bytes
 
 
 class Locator(Protocol):
@@ -26,7 +34,9 @@ class Locator(Protocol):
     async def all_inner_texts(self) -> list[str]: ...
     async def input_value(self) -> str: ...
     async def get_attribute(self, name: str) -> str | None: ...
-    async def set_input_files(self, files: Sequence[str]) -> object: ...
+    async def set_input_files(
+        self, files: Sequence[str] | Sequence[FilePayload]
+    ) -> object: ...
 
 
 class Download(Protocol):

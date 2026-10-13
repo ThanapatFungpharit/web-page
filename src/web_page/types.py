@@ -38,7 +38,8 @@ type Selectors = Mapping[SelectorKey, CssSelector]
 
 # Params
 type ParamName = str
-type ParamValue = str
+type ParamValue = str | bytes
+"""``bytes`` only for params an ``upload`` step reads as ``data``."""
 type ParamNames = Sequence[ParamName]
 type ParamValues = Mapping[ParamName, ParamValue]
 type Template = str
@@ -83,3 +84,5 @@ class Action:
     selectors_name: tuple[SelectorsName, ...]
     params: tuple[ParamName, ...]
     steps: tuple[Step, ...]
+    bytes_params: frozenset[ParamName] = frozenset()
+    """Params that may be given as ``bytes``: read as data, never formatted."""

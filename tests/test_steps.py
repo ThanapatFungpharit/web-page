@@ -22,6 +22,7 @@ from web_page.steps import (
     TargetStep,
     Uncheck,
     Upload,
+    UploadFile,
     Wait,
     WaitFor,
     WaitForUrl,
@@ -345,10 +346,60 @@ def test_upload_rejects_bad_target(value: object) -> None:
         parse_steps([{"upload": value}], [])
 
 
-@pytest.mark.parametrize("files", [None, 1, ["a", 1], {"a": "b"}])
+def test_parse_upload_file_mappings() -> None:
+    raw = [
+        {"upload": {"target": "a", "files": {"path": "{dir}/x.pdf"}}},
+        {"upload": {"target": "a", "files": {"path": "x.pdf", "name": "{n}.pdf"}}},
+        {
+            "upload": {
+                "target": "a",
+                "files": [
+                    "y.pdf",
+                    {"data": "blob", "name": "b.bin", "mime_type": "text/plain"},
+                ],
+            }
+        },
+    ]
+    assert parse_steps(raw, ["dir", "n", "blob"]) == (
+        Upload("a", ("{dir}/x.pdf",)),
+        Upload("a", (UploadFile(path="x.pdf", name="{n}.pdf"),)),
+        Upload(
+            "a",
+            ("y.pdf", UploadFile(data="blob", name="b.bin", mime_type="text/plain")),
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "files",
+    [
+        None,
+        1,
+        ["a", 1],
+        {"a": "b"},
+        {},
+        {"path": "a", "data": "d", "name": "n"},
+        {"path": "a", "extra": "x"},
+    ],
+)
 def test_upload_rejects_bad_files(files: object) -> None:
-    with pytest.raises(BadActionFile, match="path or a list of paths"):
-        parse_steps([{"upload": {"target": "avatar", "files": files}}], [])
+    with pytest.raises(BadActionFile, match="path or a mapping"):
+        parse_steps([{"upload": {"target": "avatar", "files": files}}], ["d"])
+
+
+@pytest.mark.parametrize(
+    ("file", "match"),
+    [
+        ({"data": "d"}, "needs a 'name'"),
+        ({"data": "other", "name": "n"}, "undeclared param 'other'"),
+        ({"data": 1, "name": "n"}, "needs a string value"),
+        ({"path": "a", "name": "{other}"}, "undeclared params"),
+        ({"path": "a", "mime_type": 1}, "needs a string value"),
+    ],
+)
+def test_upload_rejects_bad_file_mapping(file: object, match: str) -> None:
+    with pytest.raises(BadActionFile, match=match):
+        parse_steps([{"upload": {"target": "avatar", "files": file}}], ["d"])
 
 
 def test_upload_rejects_undeclared_param() -> None:
@@ -408,6 +459,56 @@ async def test_upload_runs_against_page(fake_page: FakePage) -> None:
         ("set_input_files", "#docs", "d/a.pdf", "b.pdf"),
         ("set_input_files", "#docs"),
     ]
+
+
+async def test_upload_sends_payloads_with_new_names(
+    fake_page: FakePage, tmp_path: Path
+) -> None:
+    original = tmp_path / "scan_0001.pdf"
+    original.write_bytes(b"%PDF")
+    plain = tmp_path / "notes.txt"
+    plain.write_bytes(b"hi")
+    ctx = ActionContext(
+        page=fake_page,
+        sel={"docs": "#docs"},
+        params={"dir": str(tmp_path), "who": "ann", "blob": b"\x00\x01", "text": "é"},
+    )
+    await Upload(
+        "docs",
+        (
+            UploadFile(path="{dir}/scan_0001.pdf", name="{who}.pdf"),
+            "{dir}/notes.txt",
+            UploadFile(data="blob", name="raw.bin"),
+            UploadFile(data="text", name="t", mime_type="text/plain"),
+        ),
+    ).run(ctx)
+
+    assert fake_page.calls == [
+        (
+            "set_input_files",
+            "#docs",
+            "ann.pdf application/pdf b'%PDF'",
+            "notes.txt text/plain b'hi'",
+            "raw.bin application/octet-stream b'\\x00\\x01'",
+            "t text/plain b'\\xc3\\xa9'",
+        )
+    ]
+    # The original file is only read: same name, same contents, no copies.
+    assert original.read_bytes() == b"%PDF"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["notes.txt", "scan_0001.pdf"]
+
+
+def test_upload_templates_and_data_params() -> None:
+    step = Upload(
+        "a",
+        (
+            "{dir}/x",
+            UploadFile(path="{dir}/y", name="{n}", mime_type="{m}"),
+            UploadFile(data="blob", name="b"),
+        ),
+    )
+    assert step.templates == ("{dir}/x", "{dir}/y", "{n}", "{m}", "b")
+    assert step.data_params == {"blob"}
 
 
 async def test_download_clicks_inside_expect_download(

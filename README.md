@@ -135,7 +135,8 @@ browser; that stays your job.
 
 About `run`:
 
-- `params` maps each name in the action's `params` to a string. You must give exactly the
+- `params` maps each name in the action's `params` to a string (or `bytes`, for an
+  [`upload` `data`](#file-steps) param). You must give exactly the
   declared names: a missing or extra name raises `BadActionParams`. For an action with
   no params, leave the argument out.
 - The return value holds whatever the action's [retrieval steps](#retrieving-data)
@@ -159,7 +160,7 @@ built-in steps call:
 | Object                  | Members used                                                                   |
 | ----------------------- | ------------------------------------------------------------------------------ |
 | `Page`                  | `url`, `goto`, `wait_for_url`, `wait_for_timeout`, `locator`, `expect_download` |
-| `Locator` (`locator()`) | `click`, `hover`, `check`, `uncheck`, `wait_for`, `fill`, `select_option`, `press`, `inner_text`, `all_inner_texts`, `input_value`, `get_attribute`, `set_input_files` |
+| `Locator` (`locator()`) | `click`, `hover`, `check`, `uncheck`, `wait_for`, `fill`, `select_option`, `press`, `inner_text`, `all_inner_texts`, `input_value`, `get_attribute`, `set_input_files` (paths, or `FilePayload` dicts of `name`, `mimeType` and `buffer`) |
 | `Download`              | `suggested_filename`, `save_as`                                                |
 
 The steps call these with Playwright's argument names and semantics: for example,
@@ -257,10 +258,45 @@ These move files between the page and the local file system.
 
 | Step       | Value                                                     | Effect                                                            |
 | ---------- | --------------------------------------------------------- | ----------------------------------------------------------------- |
-| `upload`   | `{target: <key>, files: <path> \| [<path>, ...]}`         | Sets the files of an `<input type=file>`. `[]` clears it.         |
+| `upload`   | `{target: <key>, files: <file> \| [<file>, ...]}`         | Sets the files of an `<input type=file>`. `[]` clears it.         |
 | `download` | `{target: <key>, to: <path>, as: <name>}` (`as` optional) | Clicks the element, waits for the download it starts, and saves it. |
 
 Paths are templates. A relative path is resolved against the current working directory.
+
+Each `upload` file is a path, or a mapping that sets what the page receives:
+
+| Key         | Value                                                                   |
+| ----------- | ----------------------------------------------------------------------- |
+| `path`      | Template: a local file to read.                                         |
+| `data`      | Param name: the file's contents, as `bytes` or a `str` (sent as UTF-8). |
+| `name`      | Template: the filename the page sees. Required with `data`.             |
+| `mime_type` | Template: the file's type. Default: guessed from `name`.                |
+
+Give exactly one of `path` and `data`. With `name` or `mime_type`, the file is read into
+memory and handed to the page as a payload under the new name, so the file on disk is
+never renamed, copied or changed, and no temporary file is written. With `data`, there
+is no file at all: pass the contents from Python as the param's value. A `data` param
+is the only kind that may be `bytes`, and only if no template uses it; otherwise `run`
+raises `BytesParamNotAllowed` before the first step.
+
+```yaml
+params: [dir, user, report]
+steps:
+  - upload:
+      target: attachments
+      files:
+        - "{dir}/invoice.pdf"                                   # sent as invoice.pdf
+        - {path: "{dir}/scan_0001.pdf", name: "{user}-id.pdf"}  # renamed on upload
+        - {data: report, name: report.csv}                      # no file on disk
+```
+
+```python
+await page.run("attach", {"dir": "/tmp/work", "user": "ann", "report": csv_bytes})
+```
+
+Playwright can't mix paths and payloads in one call, so when an `upload` has any
+mapping with `data`, `name` or `mime_type`, its plain paths are read into payloads too,
+keeping their own names.
 
 For `download`, `to` is either a file path or a directory. If it names an existing
 directory, or ends in `/`, the file is saved there under the name the browser suggests
@@ -323,7 +359,7 @@ Problems are caught as early as possible:
 | When        | What is checked                                                                                                  |
 | ----------- | ---------------------------------------------------------------------------------------------------------------- |
 | **On load** | File suffix and YAML syntax, manifest shape and types, unknown steps, malformed templates, undeclared params, duplicate result names, and names already loaded. |
-| **On run**  | That the action is loaded, that params match exactly, that every selectors manifest is loaded, and that every selector key exists. All of this happens **before the first step runs**. |
+| **On run**  | That the action is loaded, that params match exactly, that only `upload` data params are `bytes`, that every selectors manifest is loaded, and that every selector key exists. All of this happens **before the first step runs**. |
 
 Errors raised by the page library while a step runs, such as a timeout, are passed through
 unchanged.
@@ -344,6 +380,7 @@ WebPageError
 │   ├── ActionNotLoaded
 │   └── SelectorsNotLoaded
 ├── BadActionParams
+├── BytesParamNotAllowed
 └── UnknownSelectorKey
 ```
 
