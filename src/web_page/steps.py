@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import math
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Self
 
 from web_page.exceptions import BadActionFile
@@ -13,6 +15,7 @@ from web_page.types import (
     ManifestKey,
     Milliseconds,
     ParamNames,
+    PathTemplate,
     RawYaml,
     ResultName,
     SelectorKey,
@@ -20,7 +23,7 @@ from web_page.types import (
     Template,
     UrlTemplate,
 )
-from web_page.utils import check_placeholders
+from web_page.utils import check_placeholders, is_str_list
 
 # Filled by Step.__init_subclass__, so defining a step class is what registers it.
 _STEPS: dict[StepKind, type[Step]] = {}
@@ -232,6 +235,70 @@ class Press(TargetStep, kind="press"):
 
     async def run(self, ctx: ActionContext) -> None:
         await ctx.page.locator(ctx.sel[self.target]).press(self.key)
+
+
+# File steps: move files between the page and the local file system.
+@dataclass(frozen=True)
+class Upload(TargetStep, kind="upload"):
+    files: tuple[PathTemplate, ...]
+
+    @classmethod
+    def parse(cls, value: RawYaml, params: ParamNames) -> Self:
+        target, (files,) = _target_mapping(value, cls.kind, "files")
+        templates = [files] if isinstance(files, str) else files
+        if not is_str_list(templates):
+            raise BadActionFile(
+                f"Step {cls.kind!r} needs 'files' to be a path or a list of paths, "
+                f"not {files!r}."
+            )
+        return cls(target, tuple(_template(t, params, cls.kind) for t in templates))
+
+    async def run(self, ctx: ActionContext) -> None:
+        await ctx.page.locator(ctx.sel[self.target]).set_input_files(
+            [file.format(**ctx.params) for file in self.files]
+        )
+
+
+@dataclass(frozen=True)
+class Download(TargetStep, kind="download"):
+    """Click the target and save the download it starts.
+
+    ``to`` is a file path, or a directory (existing, or written with a trailing
+    slash) to save into under the browser's suggested filename.
+    """
+
+    to: PathTemplate
+    result: ResultName | None = None
+
+    @classmethod
+    def parse(cls, value: RawYaml, params: ParamNames) -> Self:
+        target, (to,) = _target_mapping(value, cls.kind, "to")
+        # `as` is optional, so it is not one of the mapping's required keys.
+        result: RawYaml = value.get("as") if isinstance(value, dict) else None
+        return cls(
+            target,
+            _template(to, params, cls.kind),
+            None if result is None else _result_name(result, cls.kind),
+        )
+
+    @property
+    def result_name(self) -> ResultName | None:
+        return self.result
+
+    async def run(self, ctx: ActionContext) -> None:
+        locator = ctx.page.locator(ctx.sel[self.target])
+        async with ctx.page.expect_download() as info:
+            await locator.click()
+        download = await info.value
+
+        to = self.to.format(**ctx.params)
+        path = Path(to)
+        if to.endswith(("/", os.sep)) or path.is_dir():
+            # Keep only the name, in case a page suggests one with a path in it.
+            path /= Path(download.suggested_filename).name
+        await download.save_as(str(path))
+        if self.result is not None:
+            ctx.results[self.result] = str(path.resolve())
 
 
 # Retrieval steps: save a value under a result name; WebPage.run returns them all.

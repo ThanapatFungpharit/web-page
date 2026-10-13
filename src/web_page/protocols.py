@@ -8,6 +8,8 @@ typed ``object`` so implementations may return anything there.
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Sequence
+from types import TracebackType
 from typing import Literal, Protocol
 
 
@@ -24,6 +26,31 @@ class Locator(Protocol):
     async def all_inner_texts(self) -> list[str]: ...
     async def input_value(self) -> str: ...
     async def get_attribute(self, name: str) -> str | None: ...
+    async def set_input_files(self, files: Sequence[str]) -> object: ...
+
+
+class Download(Protocol):
+    @property
+    def suggested_filename(self) -> str: ...
+
+    async def save_as(self, path: str) -> object: ...
+
+
+class DownloadInfo(Protocol):
+    """What ``async with page.expect_download() as info`` binds ``info`` to."""
+
+    @property
+    def value(self) -> Awaitable[Download]: ...
+
+
+class ExpectDownload(Protocol):
+    async def __aenter__(self) -> DownloadInfo: ...
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> object: ...
 
 
 class Page(Protocol):
@@ -38,3 +65,4 @@ class Page(Protocol):
     ) -> object: ...
     async def wait_for_timeout(self, timeout: float) -> object: ...
     def locator(self, selector: str) -> Locator: ...
+    def expect_download(self) -> ExpectDownload: ...

@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 
 from tests.conftest import FakePage
@@ -5,6 +7,7 @@ from web_page.exceptions import BadActionFile
 from web_page.steps import (
     Check,
     Click,
+    Download,
     Fill,
     GetAllTexts,
     GetAttribute,
@@ -18,6 +21,7 @@ from web_page.steps import (
     Step,
     TargetStep,
     Uncheck,
+    Upload,
     Wait,
     WaitFor,
     WaitForUrl,
@@ -311,3 +315,136 @@ async def test_retrieval_steps_save_results(fake_page: FakePage) -> None:
         "href": "href of a",
         "missing": None,
     }
+
+
+# File steps
+
+
+def test_parse_file_steps() -> None:
+    raw = [
+        {"upload": {"target": "avatar", "files": "{dir}/me.png"}},
+        {"upload": {"target": "docs", "files": ["a.pdf", "{dir}/b.pdf"]}},
+        {"upload": {"target": "docs", "files": []}},
+        {"download": {"target": "export", "to": "{dir}/"}},
+        {"download": {"target": "export", "to": "out.csv", "as": "report"}},
+    ]
+    assert parse_steps(raw, ["dir"]) == (
+        Upload("avatar", ("{dir}/me.png",)),
+        Upload("docs", ("a.pdf", "{dir}/b.pdf")),
+        Upload("docs", ()),
+        Download("export", "{dir}/"),
+        Download("export", "out.csv", "report"),
+    )
+
+
+@pytest.mark.parametrize(
+    "value", ["avatar", {"files": "a"}, {"target": 1, "files": "a"}]
+)
+def test_upload_rejects_bad_target(value: object) -> None:
+    with pytest.raises(BadActionFile, match="'target' and 'files'"):
+        parse_steps([{"upload": value}], [])
+
+
+@pytest.mark.parametrize("files", [None, 1, ["a", 1], {"a": "b"}])
+def test_upload_rejects_bad_files(files: object) -> None:
+    with pytest.raises(BadActionFile, match="path or a list of paths"):
+        parse_steps([{"upload": {"target": "avatar", "files": files}}], [])
+
+
+def test_upload_rejects_undeclared_param() -> None:
+    with pytest.raises(BadActionFile, match="undeclared params"):
+        parse_steps([{"upload": {"target": "avatar", "files": ["{dir}/a"]}}], [])
+
+
+@pytest.mark.parametrize("value", ["export", {"to": "a"}, {"target": 1, "to": "a"}])
+def test_download_rejects_bad_target(value: object) -> None:
+    with pytest.raises(BadActionFile, match="'target' and 'to'"):
+        parse_steps([{"download": value}], [])
+
+
+@pytest.mark.parametrize("to", [None, 1])
+def test_download_rejects_non_string_path(to: object) -> None:
+    with pytest.raises(BadActionFile, match="needs a string value"):
+        parse_steps([{"download": {"target": "export", "to": to}}], [])
+
+
+def test_download_rejects_undeclared_param() -> None:
+    with pytest.raises(BadActionFile, match="undeclared params"):
+        parse_steps([{"download": {"target": "export", "to": "{dir}/"}}], [])
+
+
+@pytest.mark.parametrize("name", [1, ""])
+def test_download_rejects_bad_result_name(name: object) -> None:
+    with pytest.raises(BadActionFile, match="string value|non-empty result name"):
+        parse_steps([{"download": {"target": "export", "to": "a", "as": name}}], [])
+
+
+def test_download_result_name_clashes_with_retrieval() -> None:
+    with pytest.raises(BadActionFile, match="result 'x'.*already saves"):
+        parse_steps(
+            [{"get_url": "x"}, {"download": {"target": "e", "to": "a", "as": "x"}}],
+            [],
+        )
+
+
+@pytest.mark.parametrize(
+    ("step", "key", "name"),
+    [
+        (Upload("a", ("f",)), "a", None),
+        (Download("b", "f"), "b", None),
+        (Download("c", "f", "r"), "c", "r"),
+    ],
+)
+def test_file_step_keys(step: Step, key: str, name: str | None) -> None:
+    assert step.selector_key == key
+    assert step.result_name == name
+
+
+async def test_upload_runs_against_page(fake_page: FakePage) -> None:
+    ctx = ActionContext(page=fake_page, sel={"docs": "#docs"}, params={"dir": "d"})
+    for step in (Upload("docs", ("{dir}/a.pdf", "b.pdf")), Upload("docs", ())):
+        await step.run(ctx)
+    assert fake_page.calls == [
+        ("set_input_files", "#docs", "d/a.pdf", "b.pdf"),
+        ("set_input_files", "#docs"),
+    ]
+
+
+async def test_download_clicks_inside_expect_download(
+    fake_page: FakePage, tmp_path: Path
+) -> None:
+    ctx = ActionContext(
+        page=fake_page, sel={"export": "#export"}, params={"dir": str(tmp_path)}
+    )
+    await Download("export", "{dir}/out/report.csv", "report").run(ctx)
+
+    path = str(tmp_path / "out" / "report.csv")
+    assert fake_page.calls == [
+        ("expect_download",),
+        ("click", "#export"),
+        ("downloaded",),
+        ("save_as", path),
+    ]
+    assert ctx.results == {"report": path}
+
+
+@pytest.mark.parametrize("to", ["{dir}", "{dir}/new/"])
+async def test_download_into_directory_uses_suggested_name(
+    fake_page: FakePage, tmp_path: Path, to: str
+) -> None:
+    ctx = ActionContext(
+        page=fake_page, sel={"export": "#export"}, params={"dir": str(tmp_path)}
+    )
+    await Download("export", to, "report").run(ctx)
+
+    saved = Path(fake_page.calls[-1][1])
+    assert saved.name == "report.csv"
+    assert ctx.results == {"report": str(saved.resolve())}
+
+
+async def test_download_without_result_saves_nothing(
+    fake_page: FakePage, tmp_path: Path
+) -> None:
+    ctx = ActionContext(page=fake_page, sel={"export": "#export"}, params={})
+    await Download("export", str(tmp_path / "a.csv")).run(ctx)
+    assert ctx.results == {}

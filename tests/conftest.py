@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from textwrap import dedent
+from types import TracebackType
 
 import pytest
 
@@ -67,6 +68,47 @@ class FakeLocator:
         await asyncio.sleep(0)
         return None if name == "missing" else f"{name} of {self.selector}"
 
+    async def set_input_files(self, files: Sequence[str]) -> None:
+        await asyncio.sleep(0)
+        self.calls.append(("set_input_files", self.selector, *files))
+
+
+@dataclass
+class FakeDownload:
+    suggested_filename: str
+    calls: list[Call]
+
+    async def save_as(self, path: str) -> None:
+        await asyncio.sleep(0)
+        self.calls.append(("save_as", path))
+
+
+@dataclass
+class FakeDownloadInfo:
+    download: FakeDownload
+
+    @property
+    async def value(self) -> FakeDownload:
+        await asyncio.sleep(0)
+        return self.download
+
+
+@dataclass
+class FakeExpectDownload:
+    download: FakeDownload
+
+    async def __aenter__(self) -> FakeDownloadInfo:
+        self.download.calls.append(("expect_download",))
+        return FakeDownloadInfo(self.download)
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
+        self.download.calls.append(("downloaded",))
+
 
 @dataclass
 class FakePage:
@@ -94,6 +136,9 @@ class FakePage:
 
     def locator(self, selector: str) -> FakeLocator:
         return FakeLocator(selector, self.calls)
+
+    def expect_download(self) -> FakeExpectDownload:
+        return FakeExpectDownload(FakeDownload("report.csv", self.calls))
 
 
 @pytest.fixture
