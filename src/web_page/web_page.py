@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from asyncio import Lock
 
-from playwright.async_api import Page
-
 from web_page.exceptions import (
     ActionAlreadyLoaded,
     ActionNotLoaded,
@@ -17,6 +15,7 @@ from web_page.exceptions import (
     UnknownSelectorKey,
 )
 from web_page.manifest import as_str_list, read_manifest, require
+from web_page.protocols import Page
 from web_page.steps import parse_steps
 from web_page.types import (
     Action,
@@ -26,6 +25,7 @@ from web_page.types import (
     ManifestPath,
     ParamName,
     ParamValues,
+    Results,
     SelectorKey,
     Selectors,
     SelectorsName,
@@ -84,9 +84,11 @@ class WebPage:
 
     async def run(
         self, action_name: ActionName, params: ParamValues | None = None
-    ) -> None:
+    ) -> Results:
         """Run a loaded action on the page with the given param values.
 
+        Returns the values saved by retrieval steps (``get_text`` etc.) keyed by
+        their ``as`` names, or an empty dict if the action retrieves nothing.
         Everything is validated before the first step runs, so a bad call never
         leaves the page half-driven. Steps run under a lock so concurrent calls
         on the same page don't interleave.
@@ -122,3 +124,4 @@ class WebPage:
         async with self._lock:
             for step in action.steps:
                 await step.run(ctx)
+        return ctx.results
