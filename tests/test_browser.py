@@ -5,6 +5,7 @@ from playwright.async_api import Error, async_playwright
 
 from tests.conftest import WriteYaml
 from web_page import ActionContext, WebPage
+from web_page.exceptions import ActionFailed
 
 pytestmark = pytest.mark.browser
 
@@ -411,3 +412,79 @@ async def test_dynamic_media_action_in_chromium(
     # Without `exclude`, the icon names are part of the text.
     assert isinstance(raw, list)
     assert "crop_16_9" in raw[0]
+
+
+MENU_HTML = """\
+<!doctype html>
+<div class="card" data-name="it's 1080p (HD)">Card</div>
+<div id="menu" hidden><button>Move to bin</button></div>
+<p id="status">Available</p>
+<script>
+  const menu = document.getElementById("menu");
+  document.querySelector(".card").addEventListener("contextmenu", (e) => {
+    e.preventDefault();
+    menu.hidden = false;
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") setTimeout(() => (menu.hidden = true), 50);
+  });
+</script>
+"""
+
+
+async def test_menu_action_in_chromium(tmp_path: Path, write_yaml: WriteYaml) -> None:
+    page_path = tmp_path / "menu.html"
+    page_path.write_text(MENU_HTML, encoding="utf-8")
+    selectors = write_yaml(
+        "selectors.yaml",
+        """\
+        name: menu
+        selectors:
+          card: ".card[data-name='{name:string}']"
+          menu: "#menu"
+          menu_item: "#menu >> role=button[name=/^{item:regex}$/]"
+          status: "#status"
+        """,
+    )
+    action = write_yaml(
+        "action.yaml",
+        """\
+        name: menu
+        selectors_name: menu
+        params: [url, name, item, wanted]
+        steps:
+          - goto: "{url}"
+          - click: {target: card, button: right}
+          - wait_for: menu_item
+          - press: {key: Escape}
+          - wait_for: {target: menu, state: hidden, timeout: 2000}
+          - get_text: {target: status, as: status}
+          - if:
+              equals: {result: status, value: "{wanted}"}
+              then: []
+              else: [{fail: "Status is not {wanted}"}]
+        """,
+    )
+
+    async with async_playwright() as p:
+        try:
+            browser = await p.chromium.launch()
+        except Error as e:
+            pytest.skip(f"Chromium is not installed: {e.message.splitlines()[0]}")
+        try:
+            web_page = WebPage(await browser.new_page())
+            await web_page.load_selectors(selectors)
+            await web_page.load_action(action)
+            params = {
+                "url": page_path.as_uri(),
+                "name": "it's 1080p (HD)",
+                "item": "Move to bin",
+            }
+            results = await web_page.run("menu", {**params, "wanted": "Available"})
+            with pytest.raises(ActionFailed, match="Status is not Gone") as info:
+                await web_page.run("menu", {**params, "wanted": "Gone"})
+        finally:
+            await browser.close()
+
+    assert results == {"status": "Available"}
+    assert info.value.results == {"status": "Available"}

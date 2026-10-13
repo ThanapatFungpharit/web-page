@@ -15,7 +15,8 @@ from collections.abc import Awaitable, Sequence
 from types import TracebackType
 from typing import Literal, Protocol, TypedDict
 
-type ElementState = Literal["visible", "hidden", "attached"]
+type ElementState = Literal["visible", "hidden", "attached", "detached"]
+type MouseButton = Literal["left", "right", "middle"]
 
 
 class FilePayload(TypedDict):
@@ -27,7 +28,9 @@ class FilePayload(TypedDict):
 
 
 class Locator(Protocol):
-    async def click(self, *, timeout: float | None = ...) -> object: ...
+    async def click(
+        self, *, button: MouseButton = ..., timeout: float | None = ...
+    ) -> object: ...
     async def hover(self, *, timeout: float | None = ...) -> object: ...
     async def check(self, *, timeout: float | None = ...) -> object: ...
     async def uncheck(self, *, timeout: float | None = ...) -> object: ...
@@ -57,6 +60,10 @@ class Locator(Protocol):
         self, expression: str, arg: object = ..., *, timeout: float | None = ...
     ) -> object: ...
     async def evaluate_all(self, expression: str, arg: object = ...) -> object: ...
+
+
+class Keyboard(Protocol):
+    async def press(self, key: str) -> object: ...
 
 
 class Download(Protocol):
@@ -95,6 +102,8 @@ class ExpectEvent[T](Protocol):
 class Page(Protocol):
     @property
     def url(self) -> str: ...
+    @property
+    def keyboard(self) -> Keyboard: ...
 
     async def goto(
         self,

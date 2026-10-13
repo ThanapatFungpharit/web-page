@@ -79,3 +79,29 @@ def test_check_placeholders_rejects_undeclared() -> None:
 def test_check_placeholders_rejects_malformed(template: str) -> None:
     with pytest.raises(BadActionFile, match="malformed template"):
         check_placeholders(template, ["user"], "fill")
+
+
+@pytest.mark.parametrize(
+    ("value", "escape", "expected"),
+    [
+        ("plain-id_1", "css", "plain-id_1"),
+        ("a b.c#d", "css", r"a\ b\.c\#d"),
+        ("1st", "css", r"\31 st"),
+        ("-2", "css", r"-\32 "),
+        ("-", "css", r"\-"),
+        ("é", "css", "é"),
+        ('it\'s "x" \\', "string", r"it\'s \"x\" \\"),
+        ("a.b*(c)/[d]", "regex", r"a\.b\*\(c\)\/\[d\]"),
+        ("$1 + {2}?", "regex", r"\$1 \+ \{2\}\?"),
+    ],
+)
+def test_fill_escapes(value: str, escape: str, expected: str) -> None:
+    assert fill(f"<{{v:{escape}}}>", {"v": value}) == f"<{expected}>"
+
+
+def test_escapes_are_placeholders() -> None:
+    check_placeholders("[name='{user:string}'] #{query:css}", ["user", "query"], "x")
+    with pytest.raises(BadActionFile, match="undeclared params"):
+        check_placeholders("{other:css}", ["user"], "x")
+    with pytest.raises(BadActionFile, match="escapes"):
+        check_placeholders("{user:html}", ["user"], "x")

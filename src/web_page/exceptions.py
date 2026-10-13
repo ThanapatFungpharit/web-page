@@ -1,4 +1,4 @@
-from collections.abc import Collection, Iterable
+from collections.abc import Collection, Iterable, Mapping
 
 
 class WebPageError(Exception):
@@ -154,6 +154,16 @@ class UnknownSelectorParam(WebPageError):
             f"Selector {selector_key!r} ({selector!r}) uses params "
             f"{list(self.unknown)} that action {action_name!r} does not declare."
         )
+
+
+class ActionFailed(WebPageError):
+    """Raised by a ``fail`` step: the action found the page in a state it treats
+    as an error. ``results`` holds what it had saved by then."""
+
+    def __init__(self, message: str, results: Mapping[str, object]) -> None:
+        self.message = message
+        self.results = dict(results)
+        super().__init__(message)
 
 
 class UnknownSelectorKey(WebPageError):

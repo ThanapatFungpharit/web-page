@@ -1,4 +1,6 @@
+import re
 import string
+from collections.abc import Callable
 from typing import TypeIs
 
 from web_page.exceptions import BadActionFile
@@ -52,8 +54,9 @@ def check_placeholders(template: Template, params: ParamNames, step: StepKind) -
 def placeholders(template: Template) -> set[ParamName]:
     """The param names a template uses.
 
-    Only plain ``{name}`` placeholders are allowed, plus ``{{`` and ``}}`` for
-    literal braces. ``str.format`` extras, such as ``{}``, ``{0}``,
+    Only plain ``{name}`` placeholders are allowed, optionally with an escape
+    from ``ESCAPES`` as in ``{name:css}``, plus ``{{`` and ``}}`` for literal
+    braces. ``str.format`` extras, such as ``{}``, ``{0}``,
     ``{name.attr}``, ``{name[0]}``, ``{name!r}`` and ``{name:>8}``, raise
     ``ValueError``: they would pass a load-time check but fail, or quietly
     produce something odd, when the action runs.
@@ -71,15 +74,66 @@ def placeholders(template: Template) -> set[ParamName]:
         )
         if not field or field.isdigit():
             raise ValueError(f"{written} needs a param name, as in {{name}}")
-        if spec or conversion is not None or "." in field or "[" in field:
+        if conversion is not None or "." in field or "[" in field:
             raise ValueError(
                 f"{written} is not a plain {{name}} placeholder; "
                 f"formatting, attributes and indexes are not supported"
+            )
+        if spec and spec not in ESCAPES:
+            raise ValueError(
+                f"{written} is not a plain {{name}} placeholder; the only "
+                f"formats are the escapes {sorted(ESCAPES)}, as in {{{field}:css}}"
             )
         names.add(field)
     return names
 
 
+class _Filler(string.Formatter):
+    def format_field(self, value: object, format_spec: str) -> str:
+        text = str(value)
+        return ESCAPES[format_spec](text) if format_spec else text
+
+
 def fill(template: Template, params: ParamValues) -> str:
     """Fill a template's placeholders in with params, checked beforehand."""
-    return template.format_map(params)
+    return _Filler().vformat(template, (), params)
+
+
+# Escapes: ``{name:<escape>}`` inserts the value so that it matches itself
+# literally, wherever in a selector or value it lands.
+def _css_identifier(value: str) -> str:
+    """``CSS.escape``: for an identifier, such as an id after ``#``."""
+    out: list[str] = []
+    for i, char in enumerate(value):
+        code = ord(char)
+        leading_digit = char in string.digits and (
+            i == 0 or (i == 1 and value[0] == "-")
+        )
+        if char == "\0":
+            out.append("�")
+        elif code < 0x20 or code == 0x7F or leading_digit:
+            out.append(f"\\{code:x} ")
+        elif value == "-":
+            out.append("\\-")
+        elif code >= 0x80 or char in "-_" or (char.isascii() and char.isalnum()):
+            out.append(char)
+        else:
+            out.append("\\" + char)
+    return "".join(out)
+
+
+def _quoted_string(value: str) -> str:
+    """For inside quotes: a CSS string, or a Playwright ``[name='…']``."""
+    return re.sub(r"""[\\'"]""", r"\\\g<0>", value)
+
+
+def _regex(value: str) -> str:
+    """For inside a JavaScript regex, such as ``text=/…/`` or ``[name=/…/]``."""
+    return re.sub(r"[\\^$.*+?()[\]{}|/]", r"\\\g<0>", value)
+
+
+ESCAPES: dict[str, Callable[[str], str]] = {
+    "css": _css_identifier,
+    "string": _quoted_string,
+    "regex": _regex,
+}
