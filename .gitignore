@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+.venv/
+
+# Tool caches
+.ruff_cache/
+.pytest_cache/
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Browser profile (cookies, sessions)
+google-profile/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
