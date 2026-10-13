@@ -1,7 +1,7 @@
 [project]
 name = "web-page"
 version = "0.1.0"
-description = "Add your description here"
+description = "Script a Playwright-compatible page with YAML instead of code."
 readme = "README.md"
 authors = [
     { name = "ThanapatFungpharit", email = "thanapatsun.pro@gmail.com" }
@@ -9,12 +9,11 @@ authors = [
 requires-python = ">=3.14"
 dependencies = [
     "aiofiles>=25.1.0",
-    "playwright>=1.63.0",
     "pyyaml>=6.0.3",
 ]
 
-[project.scripts]
-web-page = "web_page:main"
+[project.optional-dependencies]
+playwright = ["playwright>=1.63.0"]
 
 [build-system]
 requires = ["uv_build>=0.12.13,<0.13.0"]
@@ -22,6 +21,7 @@ build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
+    "playwright>=1.63.0",
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
     "ruff>=0.17.0",

@@ -132,7 +132,7 @@ async def test_failed_load_does_not_register(
 
 
 async def test_run(loaded: WebPage, fake_page: FakePage) -> None:
-    await loaded.run("search", {"query": "cats"})
+    assert await loaded.run("search", {"query": "cats"}) == {}
     assert fake_page.calls == [
         ("goto", "https://example.com/?q=cats", "domcontentloaded"),
         ("fill", "#q", "cats"),
@@ -152,6 +152,48 @@ async def test_run_without_params(
     )
     await web_page.run("a")
     assert fake_page.calls == [("click", "button[type=submit]")]
+
+
+async def test_run_returns_results(web_page: WebPage, write_yaml: WriteYaml) -> None:
+    await web_page.load_selectors(write_yaml("s.yaml", SELECTORS))
+    await web_page.load_action(
+        write_yaml(
+            "a.yaml",
+            """\
+            name: scrape
+            selectors_name: search_page
+            params: [query]
+            steps:
+              - goto: "https://example.com/?q={query}"
+              - get_url: url
+              - get_value: {target: search, as: typed}
+              - get_all_texts: {target: results, as: rows}
+            """,
+        )
+    )
+    assert await web_page.run("scrape", {"query": "cats"}) == {
+        "url": "https://example.com/?q=cats",
+        "typed": "value of #q",
+        "rows": ["text 1 of .results", "text 2 of .results"],
+    }
+    # Each run starts with fresh results.
+    results = await web_page.run("scrape", {"query": "dogs"})
+    assert results["url"] == "https://example.com/?q=dogs"
+
+
+async def test_run_checks_retrieval_selector_keys(
+    web_page: WebPage, write_yaml: WriteYaml
+) -> None:
+    await web_page.load_selectors(write_yaml("s.yaml", SELECTORS))
+    await web_page.load_action(
+        write_yaml(
+            "a.yaml",
+            "name: a\nselectors_name: search_page\n"
+            "steps: [{get_text: {target: nope, as: t}}]\n",
+        )
+    )
+    with pytest.raises(UnknownSelectorKey):
+        await web_page.run("a")
 
 
 async def test_run_unknown_action(loaded: WebPage) -> None:

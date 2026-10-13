@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
-from playwright.async_api import Page
+from web_page.protocols import Page
 
 if TYPE_CHECKING:
     from web_page.exceptions import BadManifest
@@ -45,6 +45,13 @@ type Template = str
 """``str.format`` template whose placeholders are param names."""
 type UrlTemplate = Template
 
+# Results
+type ResultName = str
+"""Name a retrieval step saves its value under, e.g. ``price``."""
+type ResultValue = str | list[str] | None
+"""``None`` only from ``get_attribute`` when the attribute is missing."""
+type Results = dict[ResultName, ResultValue]
+
 
 @dataclass(frozen=True, slots=True)
 class ActionContext:
@@ -53,11 +60,18 @@ class ActionContext:
     page: Page
     sel: Selectors
     params: ParamValues
+    results: Results = field(default_factory=dict)
+    """Filled by retrieval steps as they run; returned by ``WebPage.run``."""
 
 
 # Steps
 type StepKind = str
 """Manifest name of a step, e.g. ``click``."""
+type KeyName = str
+"""Playwright key or chord, e.g. ``Enter`` or ``Control+A``."""
+type Milliseconds = int | float
+type AttributeName = str
+"""HTML attribute name, e.g. ``href``."""
 
 
 @dataclass(frozen=True, slots=True)
