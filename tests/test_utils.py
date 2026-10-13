@@ -1,7 +1,7 @@
 import pytest
 
 from web_page.exceptions import BadActionFile
-from web_page.utils import check_placeholders, is_str_dict, is_str_list
+from web_page.utils import check_placeholders, fill, is_str_dict, is_str_list
 
 
 @pytest.mark.parametrize(
@@ -40,14 +40,34 @@ def test_is_str_dict(value: object, expected: bool) -> None:
         "no placeholders",
         "https://example.com/{user}",
         "{user}/{query}",
-        "{user.name}",
-        "{query[0]}",
-        "{user!r:>10}",
         "{{literal braces}}",
+        "Shift+{{",
     ],
 )
 def test_check_placeholders_accepts_declared(template: str) -> None:
     check_placeholders(template, ["user", "query"], "goto")
+
+
+@pytest.mark.parametrize(
+    ("template", "match"),
+    [
+        ("{}", "needs a param name"),
+        ("{0}", "needs a param name"),
+        ("{user.name}", "not a plain"),
+        ("{user[0]}", "not a plain"),
+        ("{user!r}", "not a plain"),
+        ("{user:>10}", "not a plain"),
+        ("{user:{query}}", "not a plain"),
+    ],
+)
+def test_placeholders_are_plain_names(template: str, match: str) -> None:
+    # These all pass str.format's own parsing, but would fail or misbehave at run.
+    with pytest.raises(BadActionFile, match=match):
+        check_placeholders(template, ["user", "query"], "goto")
+
+
+def test_fill() -> None:
+    assert fill("{a}-{{b}}-{a}", {"a": "x"}) == "x-{b}-x"
 
 
 def test_check_placeholders_rejects_undeclared() -> None:

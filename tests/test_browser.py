@@ -4,7 +4,7 @@ import pytest
 from playwright.async_api import Error, async_playwright
 
 from tests.conftest import WriteYaml
-from web_page import WebPage
+from web_page import ActionContext, WebPage
 
 pytestmark = pytest.mark.browser
 
@@ -293,3 +293,121 @@ async def test_renamed_and_data_upload_in_chromium(
         "selectors.yaml",
         "upload.html",
     ]
+
+
+MEDIA_HTML = """\
+<!doctype html>
+<style>.material-icons { font-family: monospace; }</style>
+<button id="add">Add media</button>
+<input id="picker" type="file" multiple hidden onchange="
+  const r = document.createElement('p');
+  r.className = 'names';
+  r.textContent = [...this.files].map(f => f.name).join(',');
+  document.body.append(r);
+">
+<script>
+  document.getElementById('add').onclick =
+    () => document.getElementById('picker').click();
+</script>
+<div class="card" data-id="7">
+  <button class="more" onclick="this.nextElementSibling.hidden = false">
+    <i class="material-icons">more_vert</i>
+  </button>
+  <div class="menu" hidden>
+    <a role="menuitem" href="data:text/plain,low" download="low.txt">720p</a>
+    <a role="menuitem" href="data:text/plain,high" download="high.txt">1080p</a>
+  </div>
+</div>
+<div class="setting"><i class="material-icons">crop_16_9</i> Landscape <b>16:9</b></div>
+<div class="setting"><i class="material-icons">crop_portrait</i>Portrait<br>9:16</div>
+"""
+
+
+async def test_dynamic_media_action_in_chromium(
+    tmp_path: Path, write_yaml: WriteYaml
+) -> None:
+    page_path = tmp_path / "media.html"
+    page_path.write_text(MEDIA_HTML, encoding="utf-8")
+    for name in ("a.txt", "b.txt"):
+        (tmp_path / name).write_text(name, encoding="utf-8")
+
+    selectors = write_yaml(
+        "selectors.yaml",
+        """\
+        name: media
+        selectors:
+          add: "#add"
+          names: ".names"
+          menu: ".card[data-id='{media_id}'] .more"
+          quality: ".card[data-id='{media_id}'] >> role=menuitem[name='{quality}']"
+          settings: ".setting"
+          dialog: "#dialog"
+          icons: ".material-icons"
+        """,
+    )
+    action = write_yaml(
+        "action.yaml",
+        """\
+        name: media
+        selectors_name: media
+        params: [url, paths, media_id, quality, dir]
+        steps:
+          - goto: "{url}"
+          - click: {target: dialog, timeout: 200, optional: true}
+          - if:
+              visible: dialog
+              then: [{click: dialog}]
+          - upload: {click: add, files: {param: paths}, timeout: 5000}
+          - get_text: {target: names, as: names}
+          - download:
+              steps:
+                - click: menu
+                - click: quality
+              to: "{dir}/out/"
+              timeout: 120000
+              as: video
+          - get_all_texts: {target: settings, exclude: icons, as: settings}
+          - get_all_texts: {target: settings, as: raw}
+          - call: count_cards
+        """,
+    )
+
+    async def count_cards(ctx: ActionContext) -> None:
+        ctx.results["cards"] = str(await ctx.page.locator(".card").count())
+
+    async with async_playwright() as p:
+        try:
+            browser = await p.chromium.launch()
+        except Error as e:
+            pytest.skip(f"Chromium is not installed: {e.message.splitlines()[0]}")
+        try:
+            page = await browser.new_page()
+            web_page = WebPage(page)
+            web_page.register("count_cards", count_cards)
+            await web_page.load_selectors(selectors)
+            await web_page.load_action(action)
+            results = await web_page.run(
+                "media",
+                {
+                    "url": page_path.as_uri(),
+                    "paths": [str(tmp_path / "a.txt"), str(tmp_path / "b.txt")],
+                    "media_id": "7",
+                    "quality": "1080p",
+                    "dir": str(tmp_path),
+                },
+            )
+        finally:
+            await browser.close()
+
+    video = tmp_path / "out" / "high.txt"
+    raw = results.pop("raw")
+    assert results == {
+        "names": "a.txt,b.txt",
+        "video": str(video.resolve()),
+        "settings": ["Landscape 16:9", "Portrait 9:16"],
+        "cards": "1",
+    }
+    assert video.read_text(encoding="utf-8") == "high"
+    # Without `exclude`, the icon names are part of the text.
+    assert isinstance(raw, list)
+    assert "crop_16_9" in raw[0]
