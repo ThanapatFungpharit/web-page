@@ -43,6 +43,12 @@ class SelectorsAlreadyLoaded(AlreadyLoaded):
         super().__init__(f"Selectors {selectors_name!r} have already been loaded.")
 
 
+class HookAlreadyRegistered(AlreadyLoaded):
+    def __init__(self, hook_name: str) -> None:
+        self.hook_name = hook_name
+        super().__init__(f"Hook {hook_name!r} has already been registered.")
+
+
 class NotLoaded(WebPageError):
     """Raised when running something whose dependencies have not been loaded."""
 
@@ -63,6 +69,16 @@ class SelectorsNotLoaded(NotLoaded):
         super().__init__(
             f"Action {action_name!r} needs selectors {selectors_name!r}, "
             f"which have not been loaded."
+        )
+
+
+class HookNotRegistered(NotLoaded):
+    def __init__(self, action_name: str, unknown: Collection[str]) -> None:
+        self.action_name = action_name
+        self.unknown = tuple(sorted(unknown))
+        super().__init__(
+            f"Action {action_name!r} calls hooks {list(self.unknown)}, "
+            f"which have not been registered."
         )
 
 
@@ -95,6 +111,48 @@ class BytesParamNotAllowed(WebPageError):
         super().__init__(
             f"Action {action_name!r} got bytes for params {list(self.params)}; only "
             f"params used solely as upload data may be bytes: {list(self.allowed)}."
+        )
+
+
+class ListParamNotAllowed(WebPageError):
+    def __init__(
+        self, action_name: str, params: Collection[str], allowed: Iterable[str]
+    ) -> None:
+        self.action_name = action_name
+        self.params = tuple(sorted(params))
+        self.allowed = tuple(sorted(allowed))
+        super().__init__(
+            f"Action {action_name!r} got lists for params {list(self.params)}; only "
+            f"params used solely as upload files may be lists: {list(self.allowed)}."
+        )
+
+
+class BadFilesParam(WebPageError):
+    def __init__(self, action_name: str, param: str, item: object) -> None:
+        self.action_name = action_name
+        self.param = param
+        self.item = item
+        super().__init__(
+            f"Action {action_name!r} got {item!r} in files param {param!r}; each "
+            f"file should be a path or a dict of 'name', 'mimeType' and 'buffer'."
+        )
+
+
+class UnknownSelectorParam(WebPageError):
+    def __init__(
+        self,
+        action_name: str,
+        selector_key: str,
+        selector: str,
+        unknown: Collection[str],
+    ) -> None:
+        self.action_name = action_name
+        self.selector_key = selector_key
+        self.selector = selector
+        self.unknown = tuple(sorted(unknown))
+        super().__init__(
+            f"Selector {selector_key!r} ({selector!r}) uses params "
+            f"{list(self.unknown)} that action {action_name!r} does not declare."
         )
 
 

@@ -1,22 +1,28 @@
 import asyncio
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from tests.conftest import FakePage, WriteYaml
-from web_page import WebPage
+from web_page import ActionContext, FilePayload, WebPage
 from web_page.exceptions import (
     ActionAlreadyLoaded,
     ActionNotLoaded,
     BadActionFile,
     BadActionName,
     BadActionParams,
+    BadFilesParam,
     BadSelectorsFile,
     BadSelectorsName,
     BytesParamNotAllowed,
+    HookAlreadyRegistered,
+    HookNotRegistered,
+    ListParamNotAllowed,
     SelectorsAlreadyLoaded,
     SelectorsNotLoaded,
     UnknownSelectorKey,
+    UnknownSelectorParam,
     WebPageError,
 )
 
@@ -304,6 +310,11 @@ def test_errors_share_base_class() -> None:
         SelectorsAlreadyLoaded,
         SelectorsNotLoaded,
         UnknownSelectorKey,
+        UnknownSelectorParam,
+        HookAlreadyRegistered,
+        HookNotRegistered,
+        ListParamNotAllowed,
+        BadFilesParam,
     ):
         assert issubclass(error, WebPageError)
 
@@ -352,3 +363,268 @@ async def test_run_accepts_bytes_only_for_data_params(
         ),
         ("fill", "#docs", "b"),
     ]
+
+
+# Templated selectors
+
+MEDIA_SELECTORS = """\
+    name: media
+    selectors:
+      card: "[data-id='{media_id}']"
+      menu: "[data-id='{media_id}'] button.more"
+      item: "role=menuitem[name='{item}']"
+      other: "#other-{unrelated}"
+      braces: "x{{y}}"
+"""
+
+
+async def test_selectors_are_templates(
+    web_page: WebPage, fake_page: FakePage, write_yaml: WriteYaml
+) -> None:
+    await web_page.load_selectors(write_yaml("s.yaml", MEDIA_SELECTORS))
+    await web_page.load_action(
+        write_yaml(
+            "a.yaml",
+            """\
+            name: delete
+            selectors_name: media
+            params: [media_id, item]
+            steps:
+              - hover: card
+              - click: menu
+              - click: item
+              - click: braces
+            """,
+        )
+    )
+    await web_page.run("delete", {"media_id": "42", "item": "Delete"})
+    assert fake_page.calls == [
+        ("hover", "[data-id='42']"),
+        ("click", "[data-id='42'] button.more"),
+        ("click", "role=menuitem[name='Delete']"),
+        ("click", "x{y}"),
+    ]
+
+
+async def test_selector_with_undeclared_param(
+    web_page: WebPage, fake_page: FakePage, write_yaml: WriteYaml
+) -> None:
+    await web_page.load_selectors(write_yaml("s.yaml", MEDIA_SELECTORS))
+    await web_page.load_action(
+        write_yaml(
+            "a.yaml",
+            "name: a\nselectors_name: media\nparams: [item]\n"
+            "steps: [{click: item}, {click: menu}]\n",
+        )
+    )
+    with pytest.raises(UnknownSelectorParam) as exc:
+        await web_page.run("a", {"item": "x"})
+    assert exc.value.selector_key == "menu"
+    assert exc.value.unknown == ("media_id",)
+    assert fake_page.calls == []
+
+
+async def test_hooks_see_every_selector_the_params_fill(
+    web_page: WebPage, write_yaml: WriteYaml
+) -> None:
+    seen: dict[str, str] = {}
+
+    async def look(ctx: ActionContext) -> None:
+        seen.update(ctx.sel)
+
+    web_page.register("look", look)
+    await web_page.load_selectors(write_yaml("s.yaml", MEDIA_SELECTORS))
+    await web_page.load_action(
+        write_yaml(
+            "a.yaml",
+            "name: a\nselectors_name: media\nparams: [media_id]\n"
+            "steps: [{call: look}]\n",
+        )
+    )
+    await web_page.run("a", {"media_id": "7"})
+    # `item` and `other` need params this action doesn't have, so they are left out.
+    assert seen == {
+        "card": "[data-id='7']",
+        "menu": "[data-id='7'] button.more",
+        "braces": "x{y}",
+    }
+
+
+async def test_load_selectors_rejects_malformed_template(
+    web_page: WebPage, write_yaml: WriteYaml
+) -> None:
+    path = write_yaml("s.yaml", "name: s\nselectors: {a: 'div{'}\n")
+    with pytest.raises(BadSelectorsFile, match="malformed template"):
+        await web_page.load_selectors(path)
+
+
+async def test_bytes_param_in_selector_is_rejected(
+    web_page: WebPage, write_yaml: WriteYaml
+) -> None:
+    await web_page.load_selectors(
+        write_yaml("s.yaml", "name: s\nselectors: {docs: '#{blob}'}\n")
+    )
+    await web_page.load_action(
+        write_yaml(
+            "a.yaml",
+            "name: a\nselectors_name: s\nparams: [blob]\nsteps:\n"
+            "  - upload: {target: docs, files: {data: blob, name: b}}\n",
+        )
+    )
+    with pytest.raises(BytesParamNotAllowed):
+        await web_page.run("a", {"blob": b"x"})
+
+
+# Files chosen at run time
+
+FILES_ACTION = """\
+    name: attach
+    selectors_name: form
+    params: [paths, label]
+    steps:
+      - upload: {target: docs, files: {param: paths}}
+      - fill: {target: docs, value: "{label}"}
+"""
+
+
+async def test_run_accepts_lists_only_for_files_params(
+    web_page: WebPage, fake_page: FakePage, write_yaml: WriteYaml
+) -> None:
+    await web_page.load_selectors(write_yaml("s.yaml", UPLOAD_SELECTORS))
+    await web_page.load_action(write_yaml("a.yaml", FILES_ACTION))
+
+    with pytest.raises(ListParamNotAllowed) as exc:
+        await web_page.run("attach", {"paths": [], "label": ["x"]})
+    assert exc.value.params == ("label",)
+    assert exc.value.allowed == ("paths",)
+
+    # Not a FilePayload: the kind of mistake the run-time check is for.
+    half_payload: Any = {"name": "b"}
+    with pytest.raises(BadFilesParam) as bad:
+        await web_page.run("attach", {"paths": ["a", half_payload], "label": "x"})
+    assert bad.value.item == {"name": "b"}
+    assert fake_page.calls == []
+
+    payload: FilePayload = {"name": "b", "mimeType": "text/plain", "buffer": b"B"}
+    await web_page.run("attach", {"paths": [payload], "label": "x"})
+    await web_page.run("attach", {"paths": "one.txt", "label": "x"})
+    assert fake_page.calls == [
+        ("set_input_files", "#docs", "b text/plain b'B'"),
+        ("fill", "#docs", "x"),
+        ("set_input_files", "#docs", "one.txt"),
+        ("fill", "#docs", "x"),
+    ]
+
+
+# Hooks
+
+
+async def test_register_twice(web_page: WebPage) -> None:
+    async def hook(ctx: ActionContext) -> None:
+        pass
+
+    web_page.register("h", hook)
+    with pytest.raises(HookAlreadyRegistered) as exc:
+        web_page.register("h", hook)
+    assert exc.value.hook_name == "h"
+
+
+async def test_run_checks_hooks_are_registered(
+    web_page: WebPage, fake_page: FakePage, write_yaml: WriteYaml
+) -> None:
+    await web_page.load_selectors(write_yaml("s.yaml", SELECTORS))
+    await web_page.load_action(
+        write_yaml(
+            "a.yaml",
+            "name: a\nselectors_name: search_page\nparams: [q]\nsteps:\n"
+            "  - click: submit\n"
+            "  - if: {param: q, then: [{call: pick}], else: [{call: other}]}\n",
+        )
+    )
+    with pytest.raises(HookNotRegistered) as exc:
+        await web_page.run("a", {"q": "x"})
+    assert exc.value.unknown == ("other", "pick")
+    assert fake_page.calls == []
+
+
+async def test_run_checks_nested_selector_keys(
+    web_page: WebPage, write_yaml: WriteYaml
+) -> None:
+    await web_page.load_selectors(write_yaml("s.yaml", SELECTORS))
+    await web_page.load_action(
+        write_yaml(
+            "a.yaml",
+            "name: a\nselectors_name: search_page\nsteps:\n"
+            "  - download: {steps: [{click: nope}], to: out/}\n",
+        )
+    )
+    with pytest.raises(UnknownSelectorKey) as exc:
+        await web_page.run("a")
+    assert exc.value.unknown == ("nope",)
+
+
+async def test_hook_results_are_returned(
+    web_page: WebPage, write_yaml: WriteYaml
+) -> None:
+    async def pick(ctx: ActionContext) -> None:
+        ctx.results["model"] = f"picked {ctx.params['model']}"
+
+    web_page.register("pick", pick)
+    await web_page.load_selectors(write_yaml("s.yaml", SELECTORS))
+    await web_page.load_action(
+        write_yaml(
+            "a.yaml",
+            "name: a\nselectors_name: search_page\nparams: [model]\n"
+            "steps: [{call: pick}]\n",
+        )
+    )
+    assert await web_page.run("a", {"model": "fast"}) == {"model": "picked fast"}
+
+
+# Optional steps
+
+
+class PageTimeout(Exception):
+    """Stands in for a page library's own timeout error."""
+
+
+async def test_custom_timeout_errors(write_yaml: WriteYaml) -> None:
+    async def slow(ctx: ActionContext) -> None:
+        raise PageTimeout
+
+    web_page = WebPage(FakePage(), timeout_errors=[PageTimeout])
+    web_page.register("slow", slow)
+    await web_page.load_selectors(write_yaml("s.yaml", SELECTORS))
+    await web_page.load_action(
+        write_yaml(
+            "a.yaml",
+            "name: a\nselectors_name: search_page\n"
+            "steps: [{call: {hook: slow, optional: true}}]\n",
+        )
+    )
+    assert await web_page.run("a") == {}
+
+
+async def test_optional_steps_in_a_run(
+    web_page: WebPage, fake_page: FakePage, write_yaml: WriteYaml
+) -> None:
+    fake_page.missing.add(".results")
+    await web_page.load_selectors(write_yaml("s.yaml", SELECTORS))
+    await web_page.load_action(
+        write_yaml(
+            "a.yaml",
+            """\
+            name: a
+            selectors_name: search_page
+            steps:
+              - click: {target: results, timeout: 100, optional: true}
+              - get_text: {target: results, as: snackbar, optional: true}
+              - if:
+                  visible: {target: results, timeout: 50}
+                  then: [{click: results}]
+                  else: [{click: submit}]
+            """,
+        )
+    )
+    assert await web_page.run("a") == {"snackbar": None}
+    assert fake_page.calls == [("click", "button[type=submit]")]

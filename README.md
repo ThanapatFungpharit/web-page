@@ -39,6 +39,7 @@ half-finished browser session.
 - [Manifests](#manifests)
 - [Steps](#steps)
 - [Retrieving data](#retrieving-data)
+- [Conditions and hooks](#conditions-and-hooks)
 - [Validation and errors](#validation-and-errors)
 - [Adding a step](#adding-a-step)
 - [Development](#development)
@@ -128,15 +129,22 @@ browser; that stays your job.
 
 | Method                                | Description                                                                  |
 | ------------------------------------- | ---------------------------------------------------------------------------- |
-| `WebPage(page)`                       | Wrap an async page that satisfies `web_page.Page`.                           |
+| `WebPage(page, timeout_errors=None)`  | Wrap an async page that satisfies `web_page.Page`.                           |
 | `await load_selectors(path)`          | Read and validate a selectors manifest, and register it under its `name`.    |
 | `await load_action(path)`             | Read and validate an action manifest, and register it under its `name`.      |
+| `register(name, hook)`                | Make an async function runnable from manifests as `- call: <name>`. See [hooks](#hooks). |
 | `await run(action_name, params=None)` | Run a loaded action. Returns `dict[str, str \| list[str] \| None]`.           |
+
+`timeout_errors` lists the exceptions that count as a timeout for
+[`optional`](#step-options) steps and waited-for [conditions](#if). The default,
+Python's `TimeoutError` plus Playwright's when Playwright is installed, suits
+Playwright. Set it if your page library raises something else.
 
 About `run`:
 
-- `params` maps each name in the action's `params` to a string (or `bytes`, for an
-  [`upload` `data`](#file-steps) param). You must give exactly the
+- `params` maps each name in the action's `params` to a string. There are two
+  exceptions: `bytes` for an [`upload` `data`](#file-steps) param, and a list of files
+  for an [`upload` `{param: …}`](#files-chosen-at-run-time) param. You must give exactly the
   declared names: a missing or extra name raises `BadActionParams`. For an action with
   no params, leave the argument out.
 - The return value holds whatever the action's [retrieval steps](#retrieving-data)
@@ -159,13 +167,16 @@ built-in steps call:
 
 | Object                  | Members used                                                                   |
 | ----------------------- | ------------------------------------------------------------------------------ |
-| `Page`                  | `url`, `goto`, `wait_for_url`, `wait_for_timeout`, `locator`, `expect_download` |
-| `Locator` (`locator()`) | `click`, `hover`, `check`, `uncheck`, `wait_for`, `fill`, `select_option`, `press`, `inner_text`, `all_inner_texts`, `input_value`, `get_attribute`, `set_input_files` (paths, or `FilePayload` dicts of `name`, `mimeType` and `buffer`) |
+| `Page`                  | `url`, `goto`, `wait_for_url`, `wait_for_timeout`, `locator`, `expect_download`, `expect_file_chooser` |
+| `Locator` (`locator()`) | `click`, `hover`, `check`, `uncheck`, `wait_for`, `fill`, `select_option`, `press`, `inner_text`, `all_inner_texts`, `input_value`, `get_attribute`, `set_input_files` (paths, or `FilePayload` dicts of `name`, `mimeType` and `buffer`), `is_visible`, `count`, `evaluate`, `evaluate_all` |
 | `Download`              | `suggested_filename`, `save_as`                                                |
+| `FileChooser`           | `set_files`                                                                    |
 
 The steps call these with Playwright's argument names and semantics: for example,
-`goto(url, wait_until="domcontentloaded")` and `wait_for(state="visible")`. The
-`download` step uses `expect_download()` as Playwright does:
+`goto(url, wait_until="domcontentloaded")` and `wait_for(state="visible")`. They pass
+`timeout=` only when a manifest sets one, so a library without that argument still
+works for actions that don't use it. The `download` and `upload` steps use
+`expect_download()` and `expect_file_chooser()` as Playwright does:
 `async with page.expect_download() as info`, then `await info.value`. The steps also
 expect a locator to be strict, as Playwright's are. Selector strings are passed through
 as written, so selector syntax is whatever your library supports.
@@ -183,6 +194,23 @@ A manifest is a YAML file with a `.yaml` or `.yml` suffix whose top level is a m
 
 The values can be any selector your page library accepts. For Playwright, that means
 CSS, `text=…`, `xpath=…`, `role=button[name="Save"]` and so on.
+
+Selectors are [templates](#templates) too, so they can point at an element that is
+only known at run time, such as one media item or one menu entry:
+
+```yaml
+name: library
+selectors:
+  card: "[data-media-id='{media_id}']"
+  card_menu: "[data-media-id='{media_id}'] button[aria-label='More']"
+  menu_item: "role=menuitem[name='{item}']"
+  quality: "[data-media-id='{media_id}'] >> role=menuitem[name='{quality}']"
+```
+
+`run` fills each selector in with the action's params. A selector that a step uses may
+only refer to params that the action declares. Otherwise `run` raises
+`UnknownSelectorParam` before the first step. Because braces mean placeholders, write
+a literal brace as `{{` or `}}`.
 
 ### Action manifest
 
@@ -203,15 +231,53 @@ selectors_name: [site_header, checkout_page]
 
 ### Templates
 
-`goto`, `wait_for_url`, `fill`, `select`, and the paths in `upload` and `download`
-take **templates**. These use `str.format`
-syntax, so `{query}` is replaced with the `query` param. Each placeholder must be
-declared in `params`, which is checked when the action is loaded. To get a literal
-brace, write `{{` or `}}`.
+One rule decides what is a **template**: every value that is sent to the page or the
+file system is one, and every selector is one. Names are never templates, because
+they refer to something in a manifest or in your code. Names include selector keys,
+param names, `as` result names, hook names and `get_attribute`'s attribute name.
+
+| Templates                                                                                       | Names (used as written)                                        |
+| ----------------------------------------------------------------------------------------------- | -------------------------------------------------------------- |
+| `goto` and `wait_for_url` URLs, `fill` and `select` values, `press` keys                         | `target`, `click` and `exclude` selector keys                  |
+| `upload` paths, `name` and `mime_type`; `download` `to`                                         | `params`; `data`, `param` and `equals.param` references        |
+| `if` conditions `url` and `equals.value`                                                        | `as`, `call` hook names, `get_attribute` `attribute`           |
+| every selector in a selectors manifest                                                          |                                                                |
+
+A template's `{name}` placeholders are replaced with the params of that name, and `{{`
+and `}}` are literal braces, so the `Shift+{` key is written `Shift+{{`. Only plain
+`{name}` placeholders are allowed. `str.format` extras such as `{}`, `{0}`,
+`{name.attr}`, `{name[0]}`, `{name!r}` and `{name:>8}` are rejected when the manifest
+is loaded, since they would otherwise fail, or quietly do something odd, mid-run.
+
+Every placeholder in an action must be declared in its `params`, which is checked when
+the action is loaded. Placeholders in a selector are checked when an action that uses
+it runs, because selectors and actions are loaded separately.
 
 ## Steps
 
 Each step is a mapping with a single key: the step name, then its value.
+
+### Step options
+
+Any step can also take these keys. A step whose value is a plain string uses a mapping
+form to carry them: `click: save` becomes `click: {target: save, timeout: 2000}`,
+`goto: url` becomes `goto: {url: …}`, and `get_url: name` becomes `get_url: {as: …}`.
+
+| Option     | Value             | Effect                                                                                       |
+| ---------- | ----------------- | -------------------------------------------------------------------------------------------- |
+| `timeout`  | milliseconds ≥ 0  | Overrides the page's default timeout for this step's waits. For `download` and a file-chooser `upload`, it bounds the wait for the download or chooser to start. |
+| `optional` | `true` / `false`  | If the step times out, skip it instead of failing the action. A skipped retrieval saves `None`. |
+
+`optional` only catches timeouts (see `timeout_errors` in
+[the `WebPage` API](#the-webpage-api)). Any other error still fails the action. Steps
+that never wait on the page reject `timeout`: `wait`, `get_url`, `get_all_texts`,
+`if` and `call`.
+
+```yaml
+steps:
+  - click: {target: dismiss_snackbar, timeout: 2000, optional: true}
+  - wait_for: {target: results, timeout: 30000}
+```
 
 ### Page steps
 
@@ -236,12 +302,12 @@ These act on the element that a selector key points to.
 | `wait_for` | selector key                         | Waits until the element is visible.                |
 | `fill`     | `{target: <key>, value: <template>}` | Fills the element with the formatted value.        |
 | `select`   | `{target: <key>, value: <template>}` | Selects the `<option>` with that value or label.   |
-| `press`    | `{target: <key>, key: <key name>}`   | Presses a key or chord, e.g. `Enter`, `Control+A`. |
+| `press`    | `{target: <key>, key: <template>}`   | Presses a key or chord, e.g. `Enter`, `Control+A`. |
 
 Element steps use locators (see
 [Playwright's](https://playwright.dev/python/docs/locators)), so they wait for the element to be actionable and are **strict**. If a selector matches
-more than one element, the step fails rather than picking one. `press` key names are
-not templates and are used exactly as written, so `Shift+{` works.
+more than one element, the step fails rather than picking one. Like any template, a
+`press` key writes a literal brace doubled: `Shift+{{`.
 
 ```yaml
 steps:
@@ -258,12 +324,25 @@ These move files between the page and the local file system.
 
 | Step       | Value                                                     | Effect                                                            |
 | ---------- | --------------------------------------------------------- | ----------------------------------------------------------------- |
-| `upload`   | `{target: <key>, files: <file> \| [<file>, ...]}`         | Sets the files of an `<input type=file>`. `[]` clears it.         |
-| `download` | `{target: <key>, to: <path>, as: <name>}` (`as` optional) | Clicks the element, waits for the download it starts, and saves it. |
+| `upload`   | `{target \| click \| steps, files: <file> \| [<file>, ...]}` | Gives files to the page. See below.                            |
+| `download` | `{target \| steps, to: <path>, as: <name>}` (`as` optional) | Clicks the element (or runs the steps), waits for the download that starts, and saves it. |
 
 Paths are templates. A relative path is resolved against the current working directory.
 
-Each `upload` file is a path, or a mapping that sets what the page receives:
+`upload` takes exactly one of these, which decides how the files reach the page:
+
+| Key      | Value         | How                                                                                 |
+| -------- | ------------- | ----------------------------------------------------------------------------------- |
+| `target` | selector key  | Sets the files of that `<input type=file>` directly. `files: []` clears it.         |
+| `click`  | selector key  | Clicks the element and gives the files to the file chooser it opens.                |
+| `steps`  | list of steps | Runs the steps, such as opening a menu and then clicking "Upload", and gives the files to the file chooser they open. |
+
+Use `click` or `steps` when the page has no file input you can reach, or when it only
+accepts files through its own button. The files are read before anything is clicked,
+so a missing file fails before the page changes.
+
+Each `upload` file is a path, a `{param: <name>}` mapping (see
+[below](#files-chosen-at-run-time)), or a mapping that sets what the page receives:
 
 | Key         | Value                                                                   |
 | ----------- | ----------------------------------------------------------------------- |
@@ -295,8 +374,26 @@ await page.run("attach", {"dir": "/tmp/work", "user": "ann", "report": csv_bytes
 ```
 
 Playwright can't mix paths and payloads in one call, so when an `upload` has any
-mapping with `data`, `name` or `mime_type`, its plain paths are read into payloads too,
-keeping their own names.
+payload (a mapping with `data`, `name` or `mime_type`, or a payload in a files param),
+its plain paths are read into payloads too, keeping their own names.
+
+#### Files chosen at run time
+
+When the number of files isn't known until run time, use `{param: <name>}` in `files`.
+Then pass a list as that param's value. Each item is a path string or a `FilePayload`
+dict (`name`, `mimeType`, `buffer`). A single path string also works. `run` checks the
+list's items before the first step. A list is only accepted for a param used this way
+and not in any template; any other list raises `ListParamNotAllowed`.
+
+```yaml
+params: [paths]
+steps:
+  - upload: {click: add_media_button, files: {param: paths}, timeout: 10000}
+```
+
+```python
+await page.run("add_media", {"paths": ["/tmp/a.png", "/tmp/b.png"]})
+```
 
 For `download`, `to` is either a file path or a directory. If it names an existing
 directory, or ends in `/`, the file is saved there under the name the browser suggests
@@ -315,6 +412,22 @@ steps:
 ```python
 results = await page.run("export", {"dir": "/tmp/work"})
 results["export"]  # "/tmp/work/exports/report.csv"
+```
+
+When starting the download takes more than one click, such as picking a quality from
+a menu, give `steps` instead of `target`. They run inside the wait for the download.
+`timeout` sets how long to wait for the download to start:
+
+```yaml
+params: [media_id, quality, dir]
+steps:
+  - download:
+      steps:
+        - click: card_menu  # "[data-media-id='{media_id}'] button[aria-label='More']"
+        - click: quality    # "... >> role=menuitem[name='{quality}']"
+      to: "{dir}/"
+      timeout: 120000
+      as: video
 ```
 
 ## Retrieving data
@@ -349,8 +462,98 @@ results = await page.run("read_results")
 `get_text`, `get_value` and `get_attribute` are strict, like `click`: the selector must
 match exactly one element. Use `get_all_texts` for lists. A
 [`download`](#file-steps) step with `as` also saves a result: the saved file's path. No
-two steps in an action may save under the same name; this is checked when the action is
-loaded.
+two steps in an action may save under the same name, except in the two branches of
+one `if`, since only one of them runs. This is checked when the action is loaded.
+
+### Text without icons
+
+Some pages render icons as ligature text, such as `<i class="material-icons">crop_16_9</i>`.
+`get_text` would then return `crop_16_9 Landscape`. Give `get_text` or `get_all_texts`
+an `exclude` selector key, and elements matching that selector are left out of the
+text. Like any selector, it lives in the selectors manifest:
+
+```yaml
+# selectors
+icons: "mat-icon, .material-icons, .material-symbols-outlined, .google-symbols"
+```
+
+```yaml
+# action
+- get_all_texts: {target: aspect_options, exclude: icons, as: aspects}
+  # ["Landscape 16:9", "Portrait 9:16"]
+```
+
+The `exclude` selector must be plain CSS, since the page tests each element against
+it with `Element.matches`. Playwright-only syntax such as `role=` or `>>` won't work
+there. With `exclude`, the text is read by a script on the live page, which is never changed.
+Hidden (`display: none`) elements are skipped, and runs of whitespace, line breaks
+included, become one space.
+
+## Conditions and hooks
+
+### `if`
+
+`if` runs one of two step lists depending on what is true at run time. It takes `then`,
+an optional `else`, and exactly one condition:
+
+| Condition     | Value                                             | True when                                         |
+| ------------- | ------------------------------------------------- | ------------------------------------------------- |
+| `visible`     | selector key, or `{target: <key>, timeout: <ms>}` | The element is visible.                           |
+| `hidden`      | same                                              | The element is hidden or absent.                  |
+| `exists`      | same                                              | The element is in the DOM, visible or not.        |
+| `param`       | param name                                        | The param is not empty.                           |
+| `equals`      | `{param: <name>, value: <template>}`              | The param equals the formatted value.             |
+| `url`         | URL template, with globs                          | The page's whole URL matches. `**` matches anything and `*` anything but `/`. |
+
+Without `timeout`, an element condition checks the page once, right away. With
+`timeout`, it waits up to that long for the state and is false if the state never
+comes.
+
+```yaml
+params: [media_id]
+steps:
+  - if:
+      visible: {target: trash_tab, timeout: 2000}
+      then:
+        - click: trash_tab
+  - if:
+      exists: card          # "[data-media-id='{media_id}']"
+      then:
+        - click: card_menu
+        - click: restore
+      else:
+        - get_url: not_found_at
+```
+
+### Hooks
+
+Some logic doesn't belong in YAML. Register an async function and run it with `call`:
+
+```python
+from web_page import ActionContext
+
+
+async def pick_model(ctx: ActionContext) -> None:
+    menu = ctx.page.locator(ctx.sel["model_menu"])
+    await menu.click()
+    ...
+    ctx.results["model"] = await menu.inner_text()
+
+
+page.register("pick_model", pick_model)
+```
+
+```yaml
+steps:
+  - click: settings
+  - call: pick_model
+```
+
+The hook gets the running action's `ActionContext`. `ctx.page` is the page, `ctx.sel`
+holds the selectors filled in with this run's params, `ctx.params` holds the params,
+and the hook may add to `ctx.results`. `call: {hook: pick_model, optional: true}`
+skips the hook if it raises a timeout error. `run` raises `HookNotRegistered` before
+the first step if any hook the action calls isn't registered.
 
 ## Validation and errors
 
@@ -358,8 +561,8 @@ Problems are caught as early as possible:
 
 | When        | What is checked                                                                                                  |
 | ----------- | ---------------------------------------------------------------------------------------------------------------- |
-| **On load** | File suffix and YAML syntax, manifest shape and types, unknown steps, malformed templates, undeclared params, duplicate result names, and names already loaded. |
-| **On run**  | That the action is loaded, that params match exactly, that only `upload` data params are `bytes`, that every selectors manifest is loaded, and that every selector key exists. All of this happens **before the first step runs**. |
+| **On load** | File suffix and YAML syntax, manifest shape and types, unknown steps, malformed templates (selectors included), undeclared params, bad options and conditions, duplicate result names, and names already loaded. Nested steps are checked the same way. |
+| **On run**  | That the action is loaded, that params match exactly, that every selectors manifest is loaded, that every selector key exists, that selectors use only declared params, that only `upload` data params are `bytes` and only files params are lists (with valid items), and that every called hook is registered. All of this happens **before the first step runs**. |
 
 Errors raised by the page library while a step runs, such as a timeout, are passed through
 unchanged.
@@ -375,12 +578,17 @@ WebPageError
 │       └── BadSelectorsName
 ├── AlreadyLoaded
 │   ├── ActionAlreadyLoaded
-│   └── SelectorsAlreadyLoaded
+│   ├── SelectorsAlreadyLoaded
+│   └── HookAlreadyRegistered
 ├── NotLoaded
 │   ├── ActionNotLoaded
-│   └── SelectorsNotLoaded
+│   ├── SelectorsNotLoaded
+│   └── HookNotRegistered
 ├── BadActionParams
 ├── BytesParamNotAllowed
+├── ListParamNotAllowed
+├── BadFilesParam
+├── UnknownSelectorParam
 └── UnknownSelectorKey
 ```
 
@@ -409,7 +617,7 @@ Most steps act on one element, so they can extend one of these bases:
 | `TargetValueStep`  | `{target, value}` (template)  | `self.target`, `self.value`             |
 | `TargetResultStep` | `{target, as}`                | `self.target`, `self.result`            |
 
-These bases already handle parsing, validation, `selector_key` and `result_name`, so
+These bases already handle parsing, validation, `selector_keys` and `result_name`, so
 only `run` is left to write:
 
 ```python
@@ -426,8 +634,15 @@ class DoubleClick(TargetStep, kind="dblclick"):
 ```
 
 Inside `run`, `ctx.page` is the page object, `ctx.sel` maps selector keys to
-selectors, `ctx.params` holds the param values, and `ctx.results` collects saved
-values.
+selectors (already filled in with the params), `ctx.params` holds the param values,
+and `ctx.results` collects saved values.
+
+Every step gets the [`timeout` and `optional` options](#step-options) for free.
+`optional` is handled for you. To honour `timeout`, pass `**self._timeout` to the page
+call, which is empty when no timeout is set:
+`await locator.dblclick(**self._timeout)`. A step that never waits on the page sets
+the class attribute `takes_timeout = False`, so a manifest giving it a `timeout` is
+rejected.
 
 `ctx.page` is typed as the `web_page.Page` protocol, which only lists the methods the
 built-in steps use. If your step calls something else, such as `dblclick` above, add
@@ -435,9 +650,15 @@ that method to the protocols in [`protocols.py`](src/web_page/protocols.py). Tha
 the type checker happy and documents what a page library must provide.
 
 For a step whose value has a different shape, subclass `Step` directly and implement
-`parse`, `selector_key` and `run`. See `Goto` or `Wait` in
+`parse` and `run`, plus `selector_keys` if it uses any selectors. See `Goto` or `Wait` in
 [`steps.py`](src/web_page/steps.py) for examples. A step that saves a result also
-overrides `result_name` (see `GetUrl`). A class declared without a `kind`, like
+overrides `result_name` (see `GetUrl`). A step that holds nested steps parses them
+with `parse_step_list`, runs them with `run_steps`, and returns them from
+`branches`, so that load- and run-time checks see them (see `If` and `Download`).
+Follow the [template rule](#templates) for new fields. Check a template with
+`web_page.utils.check_placeholders` in `parse`, fill it in with `web_page.utils.fill`
+in `run`, and list it in `templates`, so `run` knows its params must be strings. A
+class declared without a `kind`, like
 `TargetStep`, is a shared base and is not registered as a step. Registering the same
 `kind` twice raises `TypeError`.
 
