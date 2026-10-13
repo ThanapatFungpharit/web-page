@@ -18,7 +18,7 @@ def is_str_dict(value: RawYaml) -> TypeIs[dict[str, str]]:
 
 def check_placeholders(template: Template, params: ParamNames, step: StepKind) -> None:
     try:
-        unknown = _placeholders(template) - set(params)
+        unknown = placeholders(template) - set(params)
     except ValueError as e:
         raise BadActionFile(
             f"Step {step!r} has a malformed template {template!r}: {e}"
@@ -29,7 +29,7 @@ def check_placeholders(template: Template, params: ParamNames, step: StepKind) -
         )
 
 
-def _placeholders(template: Template) -> set[ParamName]:
+def placeholders(template: Template) -> set[ParamName]:
     return {
         field.split(".")[0].split("[")[0]
         for _, field, _, _ in string.Formatter().parse(template)

@@ -213,3 +213,83 @@ async def test_file_action_in_chromium(tmp_path: Path, write_yaml: WriteYaml) ->
     report = tmp_path / "out" / "report.csv"
     assert results == {"names": "a.txt,b.txt", "report": str(report.resolve())}
     assert report.read_text(encoding="utf-8") == "a,b"
+
+
+UPLOAD_HTML = """\
+<!doctype html>
+<input id="docs" type="file" multiple onchange="
+  Promise.all([...this.files].map(async f => f.name + '=' + await f.text()))
+    .then(parts => {
+      const r = document.createElement('p');
+      r.className = 'names';
+      r.textContent = parts.join(',');
+      document.body.append(r);
+    });
+">
+"""
+
+
+async def test_renamed_and_data_upload_in_chromium(
+    tmp_path: Path, write_yaml: WriteYaml
+) -> None:
+    page_path = tmp_path / "upload.html"
+    page_path.write_text(UPLOAD_HTML, encoding="utf-8")
+    original = tmp_path / "scan_0001.txt"
+    original.write_text("scan", encoding="utf-8")
+
+    selectors = write_yaml(
+        "selectors.yaml",
+        """\
+        name: upload
+        selectors:
+          docs: "#docs"
+          names: ".names"
+        """,
+    )
+    action = write_yaml(
+        "action.yaml",
+        """\
+        name: upload
+        selectors_name: upload
+        params: [url, dir, who, blob]
+        steps:
+          - goto: "{url}"
+          - upload:
+              target: docs
+              files:
+                - {path: "{dir}/scan_0001.txt", name: "{who}.txt"}
+                - {data: blob, name: generated.csv}
+          - get_text: {target: names, as: names}
+        """,
+    )
+
+    async with async_playwright() as p:
+        try:
+            browser = await p.chromium.launch()
+        except Error as e:
+            pytest.skip(f"Chromium is not installed: {e.message.splitlines()[0]}")
+        try:
+            page = await browser.new_page()
+            web_page = WebPage(page)
+            await web_page.load_selectors(selectors)
+            await web_page.load_action(action)
+            results = await web_page.run(
+                "upload",
+                {
+                    "url": page_path.as_uri(),
+                    "dir": str(tmp_path),
+                    "who": "ann",
+                    "blob": b"a;b",
+                },
+            )
+        finally:
+            await browser.close()
+
+    assert results == {"names": "ann.txt=scan,generated.csv=a;b"}
+    assert original.read_text(encoding="utf-8") == "scan"
+    assert sorted(p.name for p in tmp_path.iterdir()) == [
+        "action.yaml",
+        "scan_0001.txt",
+        "selectors.yaml",
+        "upload.html",
+    ]
