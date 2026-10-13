@@ -35,16 +35,21 @@ class FakeLocator:
             raise TimeoutError(f"{call[0]} {self.selector}")
         self.calls.append(_timed((call[0], self.selector, *call[1:]), timeout))
 
-    async def click(self, *, timeout: float | None = None) -> None:
-        await self._act("click", timeout=timeout)
+    async def click(
+        self, *, button: str | None = None, timeout: float | None = None
+    ) -> None:
+        if button is None:
+            await self._act("click", timeout=timeout)
+        else:
+            await self._act("click", f"button={button}", timeout=timeout)
 
     async def fill(self, value: str, *, timeout: float | None = None) -> None:
         await self._act("fill", value, timeout=timeout)
 
     async def wait_for(self, *, state: str, timeout: float | None = None) -> None:
         await asyncio.sleep(0)
-        # A missing element is hidden; any other is visible and attached.
-        if (self.selector in self.missing) != (state == "hidden"):
+        # A missing element is hidden and detached; any other is visible and attached.
+        if (self.selector in self.missing) != (state in ("hidden", "detached")):
             raise TimeoutError(f"wait_for {self.selector} {state}")
         self.calls.append(_timed(("wait_for", self.selector, state), timeout))
 
@@ -172,6 +177,15 @@ class FakeExpectEvent[T]:
 
 
 @dataclass
+class FakeKeyboard:
+    calls: list[Call]
+
+    async def press(self, key: str) -> None:
+        await asyncio.sleep(0)
+        self.calls.append(("keyboard.press", key))
+
+
+@dataclass
 class FakePage:
     """Records what steps do to it instead of driving a real browser.
 
@@ -183,6 +197,10 @@ class FakePage:
     calls: list[Call] = field(default_factory=list)
     url: str = "about:blank"
     missing: set[str] = field(default_factory=set)
+
+    @property
+    def keyboard(self) -> FakeKeyboard:
+        return FakeKeyboard(self.calls)
 
     async def goto(
         self, url: str, *, wait_until: str, timeout: float | None = None

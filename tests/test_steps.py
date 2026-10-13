@@ -4,7 +4,7 @@ import pytest
 
 from tests.conftest import FakePage
 from web_page import FilePayload
-from web_page.exceptions import BadActionFile
+from web_page.exceptions import ActionFailed, BadActionFile
 from web_page.steps import (
     Call,
     Check,
@@ -12,6 +12,7 @@ from web_page.steps import (
     Condition,
     Download,
     ElementIs,
+    Fail,
     FilesParam,
     Fill,
     GetAllTexts,
@@ -25,6 +26,8 @@ from web_page.steps import (
     ParamEquals,
     ParamIsSet,
     Press,
+    ResultEquals,
+    ResultIsSet,
     Select,
     Step,
     TargetStep,
@@ -144,9 +147,7 @@ def test_target_value_steps_reject_undeclared_param(kind: str) -> None:
         parse_steps([{kind: {"target": "search", "value": "{q}"}}], [])
 
 
-@pytest.mark.parametrize(
-    "value", ["search", {"key": "Enter"}, {"target": 1, "key": "Enter"}]
-)
+@pytest.mark.parametrize("value", ["search", {"target": 1, "key": "Enter"}])
 def test_press_rejects_bad_target(value: object) -> None:
     with pytest.raises(BadActionFile, match="'target' and 'key'"):
         parse_steps([{"press": value}], [])
@@ -888,7 +889,9 @@ def test_parse_if_conditions() -> None:
         ({"visible": "a", "param": "q", "then": []}, "one condition"),
         ({"nope": "a", "then": []}, "one condition"),
         ({"param": "other", "then": []}, "undeclared param 'other'"),
-        ({"equals": {"param": "q"}, "then": []}, "'param' and 'value'"),
+        ({"equals": {"param": "q"}, "then": []}, "'value' and either"),
+        ({"equals": {"param": "q", "result": "r", "value": ""}, "then": []}, "either"),
+        ({"result": "never_saved", "then": []}, "no earlier step saves"),
         ({"equals": {"param": "q", "value": "{x}"}, "then": []}, "undeclared"),
         ({"url": "**/{x}", "then": []}, "undeclared params"),
         ({"url": "**/{q.x}", "then": []}, "not a plain"),
@@ -1020,3 +1023,152 @@ async def test_call_runs_hook_with_context(fake_page: FakePage) -> None:
     assert fake_page.calls == [("click", "#a")]
     assert ctx.results == {"picked": "m"}
     assert Call("pick").hook_name == "pick"
+
+
+# Right-click, waiting for an element to go away, and pressing keys on the page
+
+
+def test_parse_click_button_and_wait_for_state() -> None:
+    raw = [
+        {"click": {"target": "card", "button": "right"}},
+        {"click": {"target": "card"}},
+        {"wait_for": {"target": "dialog", "state": "hidden", "timeout": 500}},
+        {"wait_for": {"target": "row", "state": "detached"}},
+        {"wait_for": {"target": "row"}},
+    ]
+    assert parse_steps(raw, []) == (
+        Click("card", "right"),
+        Click("card"),
+        WaitFor("dialog", "hidden", timeout=500),
+        WaitFor("row", "detached"),
+        WaitFor("row"),
+    )
+
+
+@pytest.mark.parametrize(
+    ("step", "match"),
+    [
+        ({"click": {"target": "a", "button": "back"}}, "'button' to be one of"),
+        ({"click": {"target": "a", "button": 2}}, "'button' to be one of"),
+        ({"wait_for": {"target": "a", "state": "gone"}}, "'state' to be one of"),
+        ({"click": {"button": "right"}}, "string 'target'"),
+    ],
+)
+def test_click_and_wait_for_reject_bad_options(
+    step: dict[str, object], match: str
+) -> None:
+    with pytest.raises(BadActionFile, match=match):
+        parse_steps([step], [])
+
+
+async def test_right_click_and_wait_for_gone(fake_page: FakePage) -> None:
+    fake_page.missing.add("#dialog")
+    ctx = ActionContext(page=fake_page, sel={"a": "#a", "d": "#dialog"}, params={})
+    await run_steps(
+        (
+            Click("a", "right"),
+            WaitFor("d", "hidden"),
+            WaitFor("d", "detached", timeout=5),
+        ),
+        ctx,
+    )
+    assert fake_page.calls == [
+        ("click", "#a", "button=right"),
+        ("wait_for", "#dialog", "hidden"),
+        ("wait_for", "#dialog", "detached", "timeout=5"),
+    ]
+    # Still there: waiting for it to go away times out.
+    with pytest.raises(TimeoutError):
+        await WaitFor("a", "hidden").run(ctx)
+
+
+def test_parse_page_press() -> None:
+    assert parse_steps([{"press": {"key": "Escape"}}], []) == (Press(None, "Escape"),)
+    assert Press(None, "Escape").selector_keys == ()
+    with pytest.raises(BadActionFile, match="without a 'target' does not take"):
+        parse_steps([{"press": {"key": "Escape", "timeout": 100}}], [])
+
+
+async def test_page_press_uses_the_keyboard(fake_page: FakePage) -> None:
+    ctx = ActionContext(page=fake_page, sel={}, params={"k": "Escape"})
+    await run_steps((Press(None, "{k}"),), ctx)
+    assert fake_page.calls == [("keyboard.press", "Escape")]
+
+
+# fail, and conditions on results
+
+
+def test_parse_fail() -> None:
+    assert parse_steps(
+        [{"fail": "No {q} left"}, {"fail": {"message": "Gone", "optional": True}}],
+        ["q"],
+    ) == (Fail("No {q} left"), Fail("Gone", optional=True))
+    with pytest.raises(BadActionFile, match="undeclared params"):
+        parse_steps([{"fail": "{x}"}], [])
+    with pytest.raises(BadActionFile, match="does not take a 'timeout'"):
+        parse_steps([{"fail": {"message": "x", "timeout": 1}}], [])
+
+
+async def test_fail_raises_with_results(fake_page: FakePage) -> None:
+    ctx = ActionContext(page=fake_page, sel={"a": "#a"}, params={"q": "credits"})
+    steps = (GetUrl("url"), Fail("No {q} left"), Click("a"))
+    with pytest.raises(ActionFailed, match="No credits left") as info:
+        await run_steps(steps, ctx)
+    assert info.value.message == "No credits left"
+    assert info.value.results == {"url": "about:blank"}
+    assert fake_page.calls == []
+
+
+def test_parse_result_conditions() -> None:
+    raw = [
+        {"get_text": {"target": "status", "as": "status"}},
+        {"if": {"result": "status", "then": []}},
+        {"if": {"equals": {"result": "status", "value": "{q}"}, "then": []}},
+    ]
+    steps = parse_steps(raw, ["q"])
+    assert steps[1:] == (
+        If(ResultIsSet("status"), ()),
+        If(ResultEquals("status", "{q}"), ()),
+    )
+    assert steps[1].results_read == ("status",)
+    assert steps[2].templates == ("{q}",)
+
+
+def test_result_condition_needs_an_earlier_step_to_save_it() -> None:
+    later: list[object] = [
+        {"if": {"result": "status", "then": []}},
+        {"get_text": {"target": "status", "as": "status"}},
+    ]
+    with pytest.raises(BadActionFile, match="reads result 'status'"):
+        parse_steps(later, [])
+    # Saved in an earlier branch counts; at run time it may be missing.
+    parse_steps(
+        [
+            {"if": {"param": "q", "then": [{"get_url": "url"}]}},
+            {"if": {"result": "url", "then": []}},
+        ],
+        ["q"],
+    )
+
+
+@pytest.mark.parametrize(
+    ("condition", "branch"),
+    [
+        (ResultIsSet("full"), "then"),
+        (ResultIsSet("empty"), "else"),
+        (ResultIsSet("none"), "else"),
+        (ResultIsSet("unsaved"), "else"),
+        (ResultEquals("full", "{q}"), "then"),
+        (ResultEquals("full", "other"), "else"),
+        (ResultEquals("unsaved", ""), "else"),
+    ],
+)
+async def test_result_conditions(
+    fake_page: FakePage, condition: Condition, branch: str
+) -> None:
+    ctx = ActionContext(
+        page=fake_page, sel={"a": "#then", "b": "#else"}, params={"q": "x"}
+    )
+    ctx.results.update({"full": "x", "empty": "", "none": None})
+    await If(condition, (Click("a"),), (Click("b"),)).run(ctx)
+    assert fake_page.calls[-1] == ("click", f"#{branch}")

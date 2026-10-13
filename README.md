@@ -167,7 +167,7 @@ built-in steps call:
 
 | Object                  | Members used                                                                   |
 | ----------------------- | ------------------------------------------------------------------------------ |
-| `Page`                  | `url`, `goto`, `wait_for_url`, `wait_for_timeout`, `locator`, `expect_download`, `expect_file_chooser` |
+| `Page`                  | `url`, `keyboard` (its `press`), `goto`, `wait_for_url`, `wait_for_timeout`, `locator`, `expect_download`, `expect_file_chooser` |
 | `Locator` (`locator()`) | `click`, `hover`, `check`, `uncheck`, `wait_for`, `fill`, `select_option`, `press`, `inner_text`, `all_inner_texts`, `input_value`, `get_attribute`, `set_input_files` (paths, or `FilePayload` dicts of `name`, `mimeType` and `buffer`), `is_visible`, `count`, `evaluate`, `evaluate_all` |
 | `Download`              | `suggested_filename`, `save_as`                                                |
 | `FileChooser`           | `set_files`                                                                    |
@@ -175,7 +175,7 @@ built-in steps call:
 The steps call these with Playwright's argument names and semantics: for example,
 `goto(url, wait_until="domcontentloaded")` and `wait_for(state="visible")`. They pass
 `timeout=` only when a manifest sets one, so a library without that argument still
-works for actions that don't use it. The `download` and `upload` steps use
+works for actions that don't use it. The same goes for `click`'s `button=`. The `download` and `upload` steps use
 `expect_download()` and `expect_file_chooser()` as Playwright does:
 `async with page.expect_download() as info`, then `await info.value`. The steps also
 expect a locator to be strict, as Playwright's are. Selector strings are passed through
@@ -240,14 +240,32 @@ param names, `as` result names, hook names and `get_attribute`'s attribute name.
 | ----------------------------------------------------------------------------------------------- | -------------------------------------------------------------- |
 | `goto` and `wait_for_url` URLs, `fill` and `select` values, `press` keys                         | `target`, `click` and `exclude` selector keys                  |
 | `upload` paths, `name` and `mime_type`; `download` `to`                                         | `params`; `data`, `param` and `equals.param` references        |
-| `if` conditions `url` and `equals.value`                                                        | `as`, `call` hook names, `get_attribute` `attribute`           |
+| `if` conditions `url` and `equals.value`; `fail` messages                                       | `as`, `result` and `equals.result`, `call` hook names, `get_attribute` `attribute` |
 | every selector in a selectors manifest                                                          |                                                                |
 
 A template's `{name}` placeholders are replaced with the params of that name, and `{{`
 and `}}` are literal braces, so the `Shift+{` key is written `Shift+{{`. Only plain
-`{name}` placeholders are allowed. `str.format` extras such as `{}`, `{0}`,
-`{name.attr}`, `{name[0]}`, `{name!r}` and `{name:>8}` are rejected when the manifest
-is loaded, since they would otherwise fail, or quietly do something odd, mid-run.
+`{name}` placeholders are allowed, optionally with an escape (below). `str.format`
+extras such as `{}`, `{0}`, `{name.attr}`, `{name[0]}`, `{name!r}` and `{name:>8}` are
+rejected when the manifest is loaded, since they would otherwise fail, or quietly do
+something odd, mid-run.
+
+#### Escaping inserted values
+
+A value inserted into a selector is read as selector syntax, so a quote, dot or
+bracket in it can break the selector or match the wrong element. Write
+`{name:<escape>}` to insert the value so that it matches itself literally:
+
+| Escape     | Use it inside                                      | Example                                   |
+| ---------- | -------------------------------------------------- | ----------------------------------------- |
+| `string`   | Quotes: a CSS string, or Playwright's `[name='…']` | `"role=menuitem[name='{item:string}']"`   |
+| `css`      | A CSS identifier, such as an id or class name      | `"#{media_id:css}"`                       |
+| `regex`    | A regex, such as `text=/…/` or `[name=/…/]`        | `"role=button[name=/^{label:regex}$/]"`   |
+
+`string` puts a backslash before `\`, `'` and `"`. `css` is the browser's
+`CSS.escape`; it also works inside a CSS string, but not inside Playwright's
+`[name='…']`, which doesn't read CSS's `\31 `-style escapes, so use `string` there.
+`regex` escapes the regex specials and `/`. Escapes work in any template.
 
 Every placeholder in an action must be declared in its `params`, which is checked when
 the action is loaded. Placeholders in a selector are checked when an action that uses
@@ -271,7 +289,7 @@ form to carry them: `click: save` becomes `click: {target: save, timeout: 2000}`
 `optional` only catches timeouts (see `timeout_errors` in
 [the `WebPage` API](#the-webpage-api)). Any other error still fails the action. Steps
 that never wait on the page reject `timeout`: `wait`, `get_url`, `get_all_texts`,
-`if` and `call`.
+`if`, `call`, `fail` and `press` without a `target`.
 
 ```yaml
 steps:
@@ -288,6 +306,7 @@ These act on the page itself.
 | `goto`         | URL template                  | `page.goto(url, wait_until="domcontentloaded")`                |
 | `wait_for_url` | URL template (globs allowed)  | `page.wait_for_url(url, wait_until="domcontentloaded")`        |
 | `wait`         | milliseconds (number ≥ 0)     | `page.wait_for_timeout(ms)`. Use `wait_for` instead when you can. |
+| `press`        | `{key: <template>}`           | `page.keyboard.press(key)`: presses a key wherever the focus is, e.g. `Escape` to close an overlay. |
 
 ### Element steps
 
@@ -295,14 +314,23 @@ These act on the element that a selector key points to.
 
 | Step       | Value                                | Effect                                             |
 | ---------- | ------------------------------------ | -------------------------------------------------- |
-| `click`    | selector key                         | Clicks the element.                                |
+| `click`    | selector key, or `{target: <key>, button: left \| right \| middle}` | Clicks the element; `button: right` opens its context menu. |
 | `hover`    | selector key                         | Hovers over the element.                           |
 | `check`    | selector key                         | Checks a checkbox or radio button.                 |
 | `uncheck`  | selector key                         | Unchecks a checkbox.                               |
-| `wait_for` | selector key                         | Waits until the element is visible.                |
+| `wait_for` | selector key, or `{target: <key>, state: <state>}` | Waits until the element is visible, or reaches `state`. |
 | `fill`     | `{target: <key>, value: <template>}` | Fills the element with the formatted value.        |
 | `select`   | `{target: <key>, value: <template>}` | Selects the `<option>` with that value or label.   |
 | `press`    | `{target: <key>, key: <template>}`   | Presses a key or chord, e.g. `Enter`, `Control+A`. |
+
+`wait_for`'s `state` is one of:
+
+| State      | Waits until the element is                              |
+| ---------- | ------------------------------------------------------- |
+| `visible`  | visible (the default)                                   |
+| `hidden`   | hidden or gone from the DOM, e.g. a dialog that closed  |
+| `attached` | in the DOM, visible or not                              |
+| `detached` | gone from the DOM, e.g. a deleted row                   |
 
 Element steps use locators (see
 [Playwright's](https://playwright.dev/python/docs/locators)), so they wait for the element to be actionable and are **strict**. If a selector matches
@@ -316,6 +344,15 @@ steps:
   - fill: {target: note, value: "{note}"}
   - press: {target: note, key: Enter}
   - wait_for_url: "**/thanks"
+```
+
+```yaml
+params: [media_id]
+steps:
+  - click: {target: card, button: right}     # "[data-media-id='{media_id:string}']"
+  - click: move_to_bin
+  - wait_for: {target: card, state: detached, timeout: 10000}
+  - press: {key: Escape}                      # close any menu left open
 ```
 
 ### File steps
@@ -502,12 +539,18 @@ an optional `else`, and exactly one condition:
 | `hidden`      | same                                              | The element is hidden or absent.                  |
 | `exists`      | same                                              | The element is in the DOM, visible or not.        |
 | `param`       | param name                                        | The param is not empty.                           |
-| `equals`      | `{param: <name>, value: <template>}`              | The param equals the formatted value.             |
+| `result`      | result name                                       | An earlier step saved the result, and it is not empty or `None`. |
+| `equals`      | `{param \| result: <name>, value: <template>}`    | The param, or saved result, equals the formatted value. |
 | `url`         | URL template, with globs                          | The page's whole URL matches. `**` matches anything and `*` anything but `/`. |
 
 Without `timeout`, an element condition checks the page once, right away. With
 `timeout`, it waits up to that long for the state and is false if the state never
 comes.
+
+A `result` condition, or `equals` with `result`, must name a result that an earlier
+step saves, which is checked when the action is loaded. If that step didn't run,
+because it was in the other branch of an `if` or was a skipped `optional` step, the
+result counts as unset.
 
 ```yaml
 params: [media_id]
@@ -523,6 +566,37 @@ steps:
         - click: restore
       else:
         - get_url: not_found_at
+```
+
+### `fail`
+
+`fail: <message template>` stops the action with `ActionFailed`. Put it in an `if` to
+turn a state of the page into an error. The exception's `message` is the formatted
+message, and its `results` holds whatever the action had saved by then, so you can
+read, for example, the text of an error banner:
+
+```yaml
+params: [prompt]
+steps:
+  - click: generate
+  - if:
+      visible: {target: quota_banner, timeout: 3000}
+      then:
+        - get_text: {target: quota_banner, as: reason}
+        - fail: "Generation for {prompt} was refused"
+  - get_attribute: {target: status, attribute: data-state, as: state}
+  - if:
+      equals: {result: state, value: failed}
+      then: [{fail: "Generation failed"}]
+```
+
+```python
+from web_page.exceptions import ActionFailed
+
+try:
+    await page.run("generate", {"prompt": "a cat"})
+except ActionFailed as e:
+    print(e.message, e.results.get("reason"))
 ```
 
 ### Hooks
@@ -555,13 +629,17 @@ and the hook may add to `ctx.results`. `call: {hook: pick_model, optional: true}
 skips the hook if it raises a timeout error. `run` raises `HookNotRegistered` before
 the first step if any hook the action calls isn't registered.
 
+Hooks suit anything that loops or keeps state between checks, which steps don't do:
+polling until an upload or generation finishes, a page script that snapshots a
+whole grid at once, or remembering whether a confirmation dialog was submitted.
+
 ## Validation and errors
 
 Problems are caught as early as possible:
 
 | When        | What is checked                                                                                                  |
 | ----------- | ---------------------------------------------------------------------------------------------------------------- |
-| **On load** | File suffix and YAML syntax, manifest shape and types, unknown steps, malformed templates (selectors included), undeclared params, bad options and conditions, duplicate result names, and names already loaded. Nested steps are checked the same way. |
+| **On load** | File suffix and YAML syntax, manifest shape and types, unknown steps, malformed templates (selectors included), undeclared params, bad options and conditions, duplicate result names, results read before any step saves them, and names already loaded. Nested steps are checked the same way. |
 | **On run**  | That the action is loaded, that params match exactly, that every selectors manifest is loaded, that every selector key exists, that selectors use only declared params, that only `upload` data params are `bytes` and only files params are lists (with valid items), and that every called hook is registered. All of this happens **before the first step runs**. |
 
 Errors raised by the page library while a step runs, such as a timeout, are passed through
@@ -589,7 +667,8 @@ WebPageError
 ├── ListParamNotAllowed
 ├── BadFilesParam
 ├── UnknownSelectorParam
-└── UnknownSelectorKey
+├── UnknownSelectorKey
+└── ActionFailed
 ```
 
 Run-time errors keep their details as attributes, so you can handle them without
