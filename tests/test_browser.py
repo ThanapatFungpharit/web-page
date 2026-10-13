@@ -150,3 +150,66 @@ async def test_form_action_in_chromium(tmp_path: Path, write_yaml: WriteYaml) ->
             }
         finally:
             await browser.close()
+
+
+FILES_HTML = """\
+<!doctype html>
+<input id="docs" type="file" multiple onchange="
+  const r = document.createElement('p');
+  r.className = 'names';
+  r.textContent = [...this.files].map(f => f.name).join(',');
+  document.body.append(r);
+">
+<a id="export" href="data:text/csv,a%2Cb" download="report.csv">Export</a>
+"""
+
+
+async def test_file_action_in_chromium(tmp_path: Path, write_yaml: WriteYaml) -> None:
+    page_path = tmp_path / "files.html"
+    page_path.write_text(FILES_HTML, encoding="utf-8")
+    for name in ("a.txt", "b.txt"):
+        (tmp_path / name).write_text(name, encoding="utf-8")
+
+    selectors = write_yaml(
+        "selectors.yaml",
+        """\
+        name: files
+        selectors:
+          docs: "#docs"
+          names: ".names"
+          export: "#export"
+        """,
+    )
+    action = write_yaml(
+        "action.yaml",
+        """\
+        name: files
+        selectors_name: files
+        params: [url, dir]
+        steps:
+          - goto: "{url}"
+          - upload: {target: docs, files: ["{dir}/a.txt", "{dir}/b.txt"]}
+          - get_text: {target: names, as: names}
+          - download: {target: export, to: "{dir}/out/", as: report}
+        """,
+    )
+
+    async with async_playwright() as p:
+        try:
+            browser = await p.chromium.launch()
+        except Error as e:
+            pytest.skip(f"Chromium is not installed: {e.message.splitlines()[0]}")
+        try:
+            page = await browser.new_page()
+            web_page = WebPage(page)
+            await web_page.load_selectors(selectors)
+            await web_page.load_action(action)
+            results = await web_page.run(
+                "files", {"url": page_path.as_uri(), "dir": str(tmp_path)}
+            )
+        finally:
+            await browser.close()
+
+    report = tmp_path / "out" / "report.csv"
+    assert results == {"names": "a.txt,b.txt", "report": str(report.resolve())}
+    assert report.read_text(encoding="utf-8") == "a,b"

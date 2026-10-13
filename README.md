@@ -158,11 +158,14 @@ built-in steps call:
 
 | Object                  | Members used                                                                   |
 | ----------------------- | ------------------------------------------------------------------------------ |
-| `Page`                  | `url`, `goto`, `wait_for_url`, `wait_for_timeout`, `locator`                   |
-| `Locator` (`locator()`) | `click`, `hover`, `check`, `uncheck`, `wait_for`, `fill`, `select_option`, `press`, `inner_text`, `all_inner_texts`, `input_value`, `get_attribute` |
+| `Page`                  | `url`, `goto`, `wait_for_url`, `wait_for_timeout`, `locator`, `expect_download` |
+| `Locator` (`locator()`) | `click`, `hover`, `check`, `uncheck`, `wait_for`, `fill`, `select_option`, `press`, `inner_text`, `all_inner_texts`, `input_value`, `get_attribute`, `set_input_files` |
+| `Download`              | `suggested_filename`, `save_as`                                                |
 
 The steps call these with Playwright's argument names and semantics: for example,
-`goto(url, wait_until="domcontentloaded")` and `wait_for(state="visible")`. They also
+`goto(url, wait_until="domcontentloaded")` and `wait_for(state="visible")`. The
+`download` step uses `expect_download()` as Playwright does:
+`async with page.expect_download() as info`, then `await info.value`. The steps also
 expect a locator to be strict, as Playwright's are. Selector strings are passed through
 as written, so selector syntax is whatever your library supports.
 
@@ -199,7 +202,8 @@ selectors_name: [site_header, checkout_page]
 
 ### Templates
 
-`goto`, `wait_for_url`, `fill` and `select` take **templates**. These use `str.format`
+`goto`, `wait_for_url`, `fill`, `select`, and the paths in `upload` and `download`
+take **templates**. These use `str.format`
 syntax, so `{query}` is replaced with the `query` param. Each placeholder must be
 declared in `params`, which is checked when the action is loaded. To get a literal
 brace, write `{{` or `}}`.
@@ -247,6 +251,36 @@ steps:
   - wait_for_url: "**/thanks"
 ```
 
+### File steps
+
+These move files between the page and the local file system.
+
+| Step       | Value                                                     | Effect                                                            |
+| ---------- | --------------------------------------------------------- | ----------------------------------------------------------------- |
+| `upload`   | `{target: <key>, files: <path> \| [<path>, ...]}`         | Sets the files of an `<input type=file>`. `[]` clears it.         |
+| `download` | `{target: <key>, to: <path>, as: <name>}` (`as` optional) | Clicks the element, waits for the download it starts, and saves it. |
+
+Paths are templates. A relative path is resolved against the current working directory.
+
+For `download`, `to` is either a file path or a directory. If it names an existing
+directory, or ends in `/`, the file is saved there under the name the browser suggests
+(from the link's `download` attribute or the `Content-Disposition` header). Missing
+parent directories are created. With `as`, the absolute path of the saved file is
+returned among the [results](#retrieving-data).
+
+```yaml
+params: [dir]
+steps:
+  - upload: {target: attachments, files: ["{dir}/invoice.pdf", "{dir}/receipt.pdf"]}
+  - click: submit
+  - download: {target: export_csv, to: "{dir}/exports/", as: export}
+```
+
+```python
+results = await page.run("export", {"dir": "/tmp/work"})
+results["export"]  # "/tmp/work/exports/report.csv"
+```
+
 ## Retrieving data
 
 Retrieval steps save a value under the name given in `as`. `WebPage.run` returns all
@@ -277,8 +311,10 @@ results = await page.run("read_results")
 ```
 
 `get_text`, `get_value` and `get_attribute` are strict, like `click`: the selector must
-match exactly one element. Use `get_all_texts` for lists. No two steps in an action may
-save under the same name; this is checked when the action is loaded.
+match exactly one element. Use `get_all_texts` for lists. A
+[`download`](#file-steps) step with `as` also saves a result: the saved file's path. No
+two steps in an action may save under the same name; this is checked when the action is
+loaded.
 
 ## Validation and errors
 

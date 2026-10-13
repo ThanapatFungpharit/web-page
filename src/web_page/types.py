@@ -44,6 +44,8 @@ type ParamValues = Mapping[ParamName, ParamValue]
 type Template = str
 """``str.format`` template whose placeholders are param names."""
 type UrlTemplate = Template
+type PathTemplate = Template
+"""Template that formats to a file path; a relative path is against the cwd."""
 
 # Results
 type ResultName = str
