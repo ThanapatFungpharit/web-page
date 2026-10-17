@@ -488,8 +488,14 @@ FILES_ACTION = """\
 
 
 async def test_run_accepts_lists_only_for_files_params(
-    web_page: WebPage, fake_page: FakePage, write_yaml: WriteYaml
+    web_page: WebPage,
+    fake_page: FakePage,
+    write_yaml: WriteYaml,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "one.txt").write_text("one")
     await web_page.load_selectors(write_yaml("s.yaml", UPLOAD_SELECTORS))
     await web_page.load_action(write_yaml("a.yaml", FILES_ACTION))
 

@@ -45,8 +45,8 @@ for params it reads as ``{param: <name>}`` files."""
 type ParamNames = Sequence[ParamName]
 type ParamValues = Mapping[ParamName, ParamValue]
 type Template = str
-"""Text whose ``{name}`` placeholders are filled in with params; ``{{`` and
-``}}`` are literal braces. Every value a step sends to the page or the file
+"""Text whose ``{name}`` placeholders use params and ``{result.name}`` use saved
+results; ``{{`` and ``}}`` are literal braces. Every value a step sends to the page or the file
 system is one, and so is every selector; names (selector keys, params,
 results, hooks, attributes) never are."""
 type UrlTemplate = Template
@@ -59,8 +59,9 @@ type PathTemplate = Template
 type ResultName = str
 """Name a retrieval step saves its value under, e.g. ``price``."""
 type ResultValue = str | list[str] | None
-"""``None`` only from ``get_attribute`` when the attribute is missing."""
+"""``None`` represents a missing attribute, skipped output or explicit hook value."""
 type Results = dict[ResultName, ResultValue]
+type ActionRunner = Callable[[ActionName, ParamValues], Awaitable[Results]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,11 +70,12 @@ class ActionContext:
 
     page: Page
     sel: Selectors
-    """Selector keys to selectors, with their placeholders already filled in."""
+    """Selector keys to selectors, resolved against current params and results."""
     params: ParamValues
     results: Results = field(default_factory=dict)
     """Filled by retrieval steps as they run; returned by ``WebPage.run``."""
     hooks: Mapping[HookName, Hook] = field(default_factory=dict)
+    run_action: ActionRunner | None = None
     timeout_errors: tuple[type[BaseException], ...] = field(
         default_factory=default_timeout_errors
     )

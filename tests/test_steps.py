@@ -192,7 +192,7 @@ def test_wait_rejects_bad_duration(ms: object) -> None:
 @pytest.mark.parametrize("kind", ["get_text", "get_all_texts", "get_value"])
 @pytest.mark.parametrize("value", ["results", {"as": "x"}, {"target": 1, "as": "x"}])
 def test_retrieval_steps_reject_bad_target(kind: str, value: object) -> None:
-    with pytest.raises(BadActionFile, match="'target' and 'as'"):
+    with pytest.raises(BadActionFile, match="'target'.*'as'"):
         parse_steps([{kind: value}], [])
 
 
@@ -479,7 +479,13 @@ def test_file_step_keys(step: Step, keys: tuple[str, ...], name: str | None) -> 
     assert step.result_name == name
 
 
-async def test_upload_runs_against_page(fake_page: FakePage) -> None:
+async def test_upload_runs_against_page(
+    fake_page: FakePage, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "d").mkdir()
+    (tmp_path / "d/a.pdf").write_bytes(b"a")
+    (tmp_path / "b.pdf").write_bytes(b"b")
     ctx = ActionContext(page=fake_page, sel={"docs": "#docs"}, params={"dir": "d"})
     for step in (Upload("docs", ("{dir}/a.pdf", "b.pdf")), Upload("docs", ())):
         await step.run(ctx)
@@ -604,7 +610,6 @@ def test_parse_options() -> None:
     [
         {"wait": {"ms": 1, "timeout": 5}},
         {"get_url": {"as": "u", "timeout": 5}},
-        {"get_all_texts": {"target": "a", "as": "t", "timeout": 5}},
         {"call": {"hook": "h", "timeout": 5}},
         {"if": {"param": "p", "then": [], "timeout": 5}},
     ],
@@ -754,7 +759,12 @@ def test_upload_list_params() -> None:
     assert step.templates == ("{dir}/x", "n")
 
 
-async def test_upload_through_file_chooser(fake_page: FakePage) -> None:
+async def test_upload_through_file_chooser(
+    fake_page: FakePage, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    for name in ("a.txt", "b.txt", "c.txt"):
+        (tmp_path / name).write_text(name)
     ctx = ActionContext(
         page=fake_page,
         sel={"add": "#add", "menu": "#menu"},
@@ -762,13 +772,23 @@ async def test_upload_through_file_chooser(fake_page: FakePage) -> None:
     )
     await run_steps(
         (
-            Upload(None, (FilesParam("paths"),), click="add", timeout=9),
+            Upload(None, (FilesParam("paths"),), click="add", timeout=1000),
             Upload(None, ("c.txt",), steps=(Click("menu"), Click("add"))),
         ),
         ctx,
     )
-    assert fake_page.calls == [
-        ("expect_file_chooser", "timeout=9"),
+    timeouts = [
+        float(call[-1].removeprefix("timeout="))
+        for call in fake_page.calls
+        if call[-1].startswith("timeout=")
+    ]
+    assert len(timeouts) == 3
+    assert 0 < timeouts[2] <= timeouts[1] <= timeouts[0] <= 1000
+    assert [
+        tuple(part for part in call if not part.startswith("timeout="))
+        for call in fake_page.calls
+    ] == [
+        ("expect_file_chooser",),
         ("click", "#add"),
         ("file_chooser started",),
         ("set_files", "a.txt", "b.txt"),
@@ -781,8 +801,10 @@ async def test_upload_through_file_chooser(fake_page: FakePage) -> None:
 
 
 async def test_files_param_mixes_paths_and_payloads(
-    fake_page: FakePage, tmp_path: Path
+    fake_page: FakePage, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "c.txt").write_text("C")
     (tmp_path / "a.txt").write_bytes(b"A")
     payload: FilePayload = {"name": "b.bin", "mimeType": "x/y", "buffer": b"B"}
     ctx = ActionContext(
@@ -844,8 +866,18 @@ async def test_download_runs_steps_inside_expect_download(
         timeout=120000,
     )
     await run_steps((step,), ctx)
-    assert fake_page.calls == [
-        ("expect_download", "timeout=120000"),
+    timeouts = [
+        float(call[-1].removeprefix("timeout="))
+        for call in fake_page.calls
+        if call[-1].startswith("timeout=")
+    ]
+    assert len(timeouts) == 3
+    assert 0 < timeouts[2] <= timeouts[1] <= timeouts[0] <= 120000
+    assert [
+        tuple(part for part in call if not part.startswith("timeout="))
+        for call in fake_page.calls
+    ] == [
+        ("expect_download",),
         ("click", "#menu"),
         ("click", "#hd"),
         ("download started",),

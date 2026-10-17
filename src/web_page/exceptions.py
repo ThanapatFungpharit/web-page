@@ -138,6 +138,23 @@ class BadFilesParam(WebPageError):
         )
 
 
+class BadParamType(WebPageError):
+    def __init__(self, action_name: str, param: str, value: object) -> None:
+        self.action_name, self.param, self.value = action_name, param, value
+        super().__init__(
+            f"Action {action_name!r} got {type(value).__name__} for param {param!r}; "
+            "expected a string, upload bytes or a list of files."
+        )
+
+
+class BadResultValue(WebPageError):
+    def __init__(
+        self, result: str, value: object, expected: str = "a string in a template"
+    ) -> None:
+        self.result, self.value = result, value
+        super().__init__(f"Result {result!r} must be {expected}, not {value!r}.")
+
+
 class UnknownSelectorParam(WebPageError):
     def __init__(
         self,

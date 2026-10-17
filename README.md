@@ -154,6 +154,19 @@ About `run`:
 - Calls to `run` on the same `WebPage` take turns under a lock, so their steps never
   interleave.
 
+Templates are compiled when their manifests load and retained with the loaded
+steps and selectors. Action metadata, including selector keys, hooks, outputs and
+child calls, is also collected once at load time. These compiled templates keep
+working independently of the fallback template cache.
+
+The first run links the action to its selector manifests and child actions, checks
+their dependencies before touching the page, and retains the successful linked
+plan. Loading another action or selector manifest, or registering a hook, clears
+the linked plans so they are checked against the new registry on next use. Each
+run still validates its parameter values and resolves templates against current
+params and results. Because manifests can load in any order, dependency linking is
+deferred until the first run.
+
 ## Using another browser library
 
 `WebPage` accepts any object that matches the `web_page.Page` protocol. That includes
@@ -184,6 +197,9 @@ as written, so selector syntax is whatever your library supports.
 ## Manifests
 
 A manifest is a YAML file with a `.yaml` or `.yml` suffix whose top level is a mapping.
+Duplicate YAML keys and unknown manifest or step fields are rejected instead of
+silently replacing or ignoring values. YAML merge keys (`<<`) still support
+overriding inherited values with explicit keys.
 
 ### Selectors manifest
 
@@ -245,10 +261,25 @@ param names, `as` result names, hook names and `get_attribute`'s attribute name.
 
 A template's `{name}` placeholders are replaced with the params of that name, and `{{`
 and `}}` are literal braces, so the `Shift+{` key is written `Shift+{{`. Only plain
-`{name}` placeholders are allowed, optionally with an escape (below). `str.format`
+`{name}` parameter placeholders and `{result.name}` saved-result references are
+allowed, optionally with an escape (below). Other `str.format`
 extras such as `{}`, `{0}`, `{name.attr}`, `{name[0]}`, `{name!r}` and `{name:>8}` are
 rejected when the manifest is loaded, since they would otherwise fail, or quietly do
 something odd, mid-run.
+
+Saved results can feed later values and selectors:
+
+```yaml
+steps:
+  - get_value: {target: source, as: copied}
+  - fill: {target: destination, value: "{result.copied}"}
+```
+
+Only an earlier, declared result may be referenced. Step templates are checked on
+load; references in used selectors are checked before a run. References are resolved
+when the step runs, so selector templates can use results too. The result must be a
+string: missing results, `None` and lists raise `BadResultValue` rather than silently
+turning into text. Guard possibly unset results with `if: {result: name, ...}`.
 
 #### Escaping inserted values
 
@@ -258,16 +289,21 @@ bracket in it can break the selector or match the wrong element. Write
 
 | Escape     | Use it inside                                      | Example                                   |
 | ---------- | -------------------------------------------------- | ----------------------------------------- |
-| `string`   | Quotes: a CSS string, or Playwright's `[name='…']` | `"role=menuitem[name='{item:string}']"`   |
+| `string`   | A quoted CSS attribute string                    | `"[data-name='{item:string}']"`          |
+| `role`     | Playwright's quoted `[name='…']`                  | `"role=menuitem[name='{item:role}']"`     |
 | `css`      | A CSS identifier, such as an id or class name      | `"#{media_id:css}"`                       |
 | `regex`    | A regex, such as `text=/…/` or `[name=/…/]`        | `"role=button[name=/^{label:regex}$/]"`   |
 
-`string` puts a backslash before `\`, `'` and `"`. `css` is the browser's
-`CSS.escape`; it also works inside a CSS string, but not inside Playwright's
-`[name='…']`, which doesn't read CSS's `\31 `-style escapes, so use `string` there.
+`string` escapes quotes, backslashes and control characters using CSS string rules.
+`role` escapes quotes and backslashes using Playwright's role-selector rules, which
+do not interpret CSS hexadecimal escapes. Existing role selectors using `string`
+still work for ordinary text; use `role` when the value may contain control characters.
+CSS replaces NUL characters with the replacement character, as `CSS.escape` does.
+`css` is the browser's `CSS.escape`; it also works inside a CSS string, but not inside
+Playwright's `[name='…']`, so use `role` there.
 `regex` escapes the regex specials and `/`. Escapes work in any template.
 
-Every placeholder in an action must be declared in its `params`, which is checked when
+Every parameter placeholder in an action must be declared in its `params`, which is checked when
 the action is loaded. Placeholders in a selector are checked when an action that uses
 it runs, because selectors and actions are loaded separately.
 
@@ -279,16 +315,17 @@ Each step is a mapping with a single key: the step name, then its value.
 
 Any step can also take these keys. A step whose value is a plain string uses a mapping
 form to carry them: `click: save` becomes `click: {target: save, timeout: 2000}`,
-`goto: url` becomes `goto: {url: …}`, and `get_url: name` becomes `get_url: {as: …}`.
+`goto: url` becomes `goto: {url: …}`, `wait: 10` becomes
+`wait: {ms: 10, optional: true}`, and `get_url: name` becomes `get_url: {as: …}`.
 
 | Option     | Value             | Effect                                                                                       |
 | ---------- | ----------------- | -------------------------------------------------------------------------------------------- |
-| `timeout`  | milliseconds ≥ 0  | Overrides the page's default timeout for this step's waits. For `download` and a file-chooser `upload`, it bounds the wait for the download or chooser to start. |
+| `timeout`  | milliseconds ≥ 0  | Overrides the page's default timeout for this step's waits. For `upload`, `download`, `get_all_texts`, `repeat`, `retry` and `run`, it bounds the entire step. Zero disables the timeout. |
 | `optional` | `true` / `false`  | If the step times out, skip it instead of failing the action. A skipped retrieval saves `None`. |
 
 `optional` only catches timeouts (see `timeout_errors` in
 [the `WebPage` API](#the-webpage-api)). Any other error still fails the action. Steps
-that never wait on the page reject `timeout`: `wait`, `get_url`, `get_all_texts`,
+that never wait on the page reject `timeout`: `wait`, `get_url`,
 `if`, `call`, `fail` and `press` without a `target`.
 
 ```yaml
@@ -375,8 +412,11 @@ Paths are templates. A relative path is resolved against the current working dir
 | `steps`  | list of steps | Runs the steps, such as opening a menu and then clicking "Upload", and gives the files to the file chooser they open. |
 
 Use `click` or `steps` when the page has no file input you can reach, or when it only
-accepts files through its own button. The files are read before anything is clicked,
-so a missing file fails before the page changes.
+accepts files through its own button. Every local file is opened and checked before
+the upload's trigger runs, so a missing file fails before that trigger changes the
+page. Plain paths remain path-based uploads; renamed files and mixed path/payload
+uploads are read into memory. Filesystem changes after this check can still fail
+during transfer. Earlier steps in the action are not rolled back.
 
 Each `upload` file is a path, a `{param: <name>}` mapping (see
 [below](#files-chosen-at-run-time)), or a mapping that sets what the page receives:
@@ -453,7 +493,13 @@ results["export"]  # "/tmp/work/exports/report.csv"
 
 When starting the download takes more than one click, such as picking a quality from
 a menu, give `steps` instead of `target`. They run inside the wait for the download.
-`timeout` sets how long to wait for the download to start:
+`timeout` bounds the whole download step: trigger steps, waiting for the event and
+saving the file. Upload deadlines similarly include file preparation, trigger steps
+and assigning files. A deadline raises Python's `TimeoutError`, which `optional`
+catches even with custom `timeout_errors`:
+
+Nested browser waits receive the remaining deadline, including trigger clicks and
+chooser file assignment. A nested timeout cannot extend an enclosing deadline.
 
 ```yaml
 params: [media_id, quality, dir]
@@ -502,6 +548,15 @@ match exactly one element. Use `get_all_texts` for lists. A
 two steps in an action may save under the same name, except in the two branches of
 one `if`, since only one of them runs. This is checked when the action is loaded.
 
+`get_all_texts` keeps its immediate snapshot behavior by default. Give it `timeout`
+to wait for at least one match before reading all matches; it supports multiple
+elements without a strict-locator error. With `optional: true`, a timeout saves
+`None`. Without a timeout, no matches produces `[]`.
+
+```yaml
+- get_all_texts: {target: result_titles, as: titles, timeout: 5000}
+```
+
 ### Text without icons
 
 Some pages render icons as ligature text, such as `<i class="material-icons">crop_16_9</i>`.
@@ -523,7 +578,8 @@ icons: "mat-icon, .material-icons, .material-symbols-outlined, .google-symbols"
 The `exclude` selector must be plain CSS, since the page tests each element against
 it with `Element.matches`. Playwright-only syntax such as `role=` or `>>` won't work
 there. With `exclude`, the text is read by a script on the live page, which is never changed.
-Hidden (`display: none`) elements are skipped, and runs of whitespace, line breaks
+Hidden (`display: none`) elements and text with `visibility: hidden` or `collapse`
+are skipped; descendants that explicitly restore visibility are included. Runs of whitespace, line breaks
 included, become one space.
 
 ## Conditions and hooks
@@ -541,11 +597,16 @@ an optional `else`, and exactly one condition:
 | `param`       | param name                                        | The param is not empty.                           |
 | `result`      | result name                                       | An earlier step saved the result, and it is not empty or `None`. |
 | `equals`      | `{param \| result: <name>, value: <template>}`    | The param, or saved result, equals the formatted value. |
-| `url`         | URL template, with globs                          | The page's whole URL matches. `**` matches anything and `*` anything but `/`. |
+| `url`         | URL template, with globs                          | The whole URL matches a Playwright-style URL glob. |
 
 Without `timeout`, an element condition checks the page once, right away. With
 `timeout`, it waits up to that long for the state and is false if the state never
 comes.
+
+URL conditions use the same glob semantics as Playwright URL waits: `*` excludes
+slashes, `**` can cross them, a middle `/**/` can match zero directories, backslashes escape
+literal characters, and `{a,b}` gives alternatives. Double template braces when
+writing alternatives: `"**/{{report,export}}.csv"`.
 
 A `result` condition, or `equals` with `result`, must name a result that an earlier
 step saves, which is checked when the action is loaded. If that step didn't run,
@@ -624,14 +685,91 @@ steps:
 ```
 
 The hook gets the running action's `ActionContext`. `ctx.page` is the page, `ctx.sel`
-holds the selectors filled in with this run's params, `ctx.params` holds the params,
+resolves selectors using this run's params and current results, `ctx.params` holds the params,
 and the hook may add to `ctx.results`. `call: {hook: pick_model, optional: true}`
 skips the hook if it raises a timeout error. `run` raises `HookNotRegistered` before
 the first step if any hook the action calls isn't registered.
 
-Hooks suit anything that loops or keeps state between checks, which steps don't do:
-polling until an upload or generation finishes, a page script that snapshots a
-whole grid at once, or remembering whether a confirmation dialog was submitted.
+Declare hook outputs to make them available to result conditions, templates and
+action exports. `results` lists names the hook writes into `ctx.results`; omitted
+outputs become `None`. `as` saves the hook's return value (`str`, `list[str]` or
+`None`). Both can be used together, with distinct names:
+
+```yaml
+- call: {hook: pick_model, results: [model]}
+- if:
+    result: model
+    then:
+      - fill: {target: model_search, value: "{result.model}"}
+```
+
+An optional hook that times out saves `None` for its declared outputs. Hooks without
+declarations still work as before, but their dynamically added names are not
+available to static result validation. Hooks remain useful for arbitrary Python
+state, custom page scripts and browser APIs beyond the built-in steps. Inside a hook,
+`await ctx.run_action(name, params)` calls another action under the current run's lock
+and returns its results.
+
+### Repetition, polling and retries
+
+`repeat` runs `steps` a positive integer number of `times`. With `until`, it checks
+that condition after each iteration, returns early when true, and raises
+`ActionFailed` with the latest results if the count is exhausted. `until` accepts
+the same single-condition mapping as `if`. `interval` is the delay in milliseconds
+between iterations, defaulting to zero. `timeout` optionally bounds the whole group.
+
+```yaml
+- repeat:
+    times: 20
+    interval: 500
+    timeout: 15000
+    steps:
+      - get_attribute: {target: job, attribute: data-state, as: state}
+    until:
+      equals: {result: state, value: complete}
+```
+
+Results declared inside the group hold the latest iteration's values. They are
+cleared before each iteration so branches cannot accidentally reuse an older value.
+An iteration cannot reference a result that only a later step in it saves.
+
+`retry` reruns its whole `steps` group after a timeout or `ActionFailed`, up to a
+positive integer number of `attempts`. Other errors propagate immediately. Results
+are restored to their pre-group state before each attempt; browser side effects
+are retained. Use retry groups for operations that can safely be repeated. The
+final failure is propagated, and `timeout` can bound all attempts and intervals.
+
+```yaml
+- retry:
+    attempts: 3
+    interval: 250
+    timeout: 10000
+    steps:
+      - click: refresh
+      - wait_for: {target: ready, timeout: 2000}
+```
+
+### Calling another action
+
+Use `run: action_name` for an action with no params or exported results. The mapping
+form accepts `action`, `params` (child parameter names to string templates), and
+`results` (child result names to names saved in the caller):
+
+```yaml
+- run:
+    action: search
+    params: {query: "{result.copied}"}
+    results: {titles: search_titles}
+    timeout: 10000
+```
+
+The child has its own params, selectors and results. Only explicitly mapped results
+are copied back; an output from a skipped branch becomes `None`. Children execute
+under the outer run's lock. Missing actions, bad parameter names, missing hooks or
+selectors, unknown exports and recursive action calls are rejected before the first
+step of the outer action. Child parameter templates resolve when the child is called
+and accept string values. `optional` skips a child that times out and saves `None`
+for its mapped outputs.
 
 ## Validation and errors
 
@@ -639,13 +777,16 @@ Problems are caught as early as possible:
 
 | When        | What is checked                                                                                                  |
 | ----------- | ---------------------------------------------------------------------------------------------------------------- |
-| **On load** | File suffix and YAML syntax, manifest shape and types, unknown steps, malformed templates (selectors included), undeclared params, bad options and conditions, duplicate result names, results read before any step saves them, and names already loaded. Nested steps are checked the same way. |
-| **On run**  | That the action is loaded, that params match exactly, that every selectors manifest is loaded, that every selector key exists, that selectors use only declared params, that only `upload` data params are `bytes` and only files params are lists (with valid items), and that every called hook is registered. All of this happens **before the first step runs**. |
+| **On load** | File suffix and YAML syntax, duplicate YAML keys, manifest shape and types, unknown fields and steps, malformed templates (selectors included), undeclared params, bad options and conditions, duplicate result names, results read before any step saves them, and names already loaded. Nested steps are checked the same way. |
+| **On run**  | That the action is loaded, params match exactly and have valid types, every selectors manifest is loaded, every selector key exists, selectors use declared params and earlier results, only `upload` data params are `bytes` and only files params are lists (with valid items), and every called hook is registered. Nested action dependencies, exports and cycles are also checked. All of this happens **before the first step runs**. |
 
 Errors raised by the page library while a step runs, such as a timeout, are passed through
-unchanged.
+unchanged. A whole-step deadline raises Python's `TimeoutError`. Values obtained
+from the live page or hooks, and filesystem availability, can only be checked when
+they are used; these failures do not roll back earlier browser actions.
 
-Every error raised by this package derives from `web_page.exceptions.WebPageError`:
+Manifest and action validation errors derive from `web_page.exceptions.WebPageError`.
+Browser, filesystem and whole-step deadline exceptions behave as described above:
 
 ```text
 WebPageError
@@ -663,6 +804,8 @@ WebPageError
 │   ├── SelectorsNotLoaded
 │   └── HookNotRegistered
 ├── BadActionParams
+├── BadParamType
+├── BadResultValue
 ├── BytesParamNotAllowed
 ├── ListParamNotAllowed
 ├── BadFilesParam
@@ -719,7 +862,8 @@ and `ctx.results` collects saved values.
 Every step gets the [`timeout` and `optional` options](#step-options) for free.
 `optional` is handled for you. To honour `timeout`, pass `**self._timeout` to the page
 call, which is empty when no timeout is set:
-`await locator.dblclick(**self._timeout)`. A step that never waits on the page sets
+`await locator.dblclick(**self._timeout)`. Set `total_timeout = True` for a step
+whose timeout must bound the whole operation, including nested work. A step that never waits on the page sets
 the class attribute `takes_timeout = False`, so a manifest giving it a `timeout` is
 rejected.
 
@@ -736,7 +880,11 @@ with `parse_step_list`, runs them with `run_steps`, and returns them from
 `branches`, so that load- and run-time checks see them (see `If` and `Download`).
 Follow the [template rule](#templates) for new fields. Check a template with
 `web_page.utils.check_placeholders` in `parse`, fill it in with `web_page.utils.fill`
-in `run`, and list it in `templates`, so `run` knows its params must be strings. A
+in `run` (passing `ctx.results` as the third argument to support saved results), and
+list it in `templates`, so validation can check parameter and result references. A
+custom step can retain compiled syntax by storing the result of
+`web_page.utils.prepare_template(template)` in `parse`; it remains string-compatible
+and `fill` uses its bound compiled representation. A
 class declared without a `kind`, like
 `TargetStep`, is a shared base and is not registered as a step. Registering the same
 `kind` twice raises `TypeError`.

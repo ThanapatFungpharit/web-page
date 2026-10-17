@@ -5,14 +5,17 @@ import mimetypes
 import os
 import re
 from abc import ABC, abstractmethod
+from asyncio import get_running_loop, sleep
+from asyncio import timeout as deadline
 from collections.abc import Iterable, Iterator
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import ClassVar, Self, TypedDict
 
 import aiofiles
 
-from web_page.exceptions import ActionFailed, BadActionFile
+from web_page.exceptions import ActionFailed, BadActionFile, BadResultValue
 from web_page.protocols import ElementState, FilePayload, MouseButton
 from web_page.types import (
     ActionContext,
@@ -28,22 +31,40 @@ from web_page.types import (
     PathTemplate,
     RawYaml,
     ResultName,
+    Results,
     SelectorKey,
     StepKind,
     Template,
     UrlTemplate,
 )
-from web_page.utils import check_placeholders, fill
+from web_page.utils import (
+    check_placeholders,
+    fill,
+    is_result_value,
+    prepare_template,
+    result_placeholders,
+)
 
 # Filled by Step.__init_subclass__, so defining a step class is what registers it.
 _STEPS: dict[StepKind, type[Step]] = {}
 
 # Keys any step's mapping form may carry besides its own; see Step.
 _OPTION_KEYS = frozenset({"timeout", "optional"})
+_DEADLINE: ContextVar[float | None] = ContextVar("web_page_deadline", default=None)
 
 
 class _TimeoutArg(TypedDict, total=False):
     timeout: Milliseconds
+
+
+def _timeout_arg(configured: Milliseconds | None = None) -> _TimeoutArg:
+    expires = _DEADLINE.get()
+    if expires is None:
+        return {} if configured is None else {"timeout": configured}
+    remaining = (expires - get_running_loop().time()) * 1000
+    if remaining <= 0:
+        raise TimeoutError("Step deadline expired.")
+    return {"timeout": min(configured, remaining) if configured else remaining}
 
 
 _MOUSE_BUTTONS: tuple[MouseButton, ...] = ("left", "right", "middle")
@@ -67,6 +88,8 @@ class Step(ABC):
     kind: ClassVar[StepKind]
     takes_timeout: ClassVar[bool] = True
     """False for steps that never wait on the page, so a timeout would do nothing."""
+    total_timeout: ClassVar[bool] = False
+    reads_after_branches: ClassVar[bool] = False
 
     timeout: Milliseconds | None = field(default=None, kw_only=True)
     optional: bool = field(default=False, kw_only=True)
@@ -96,6 +119,10 @@ class Step(ABC):
     def result_name(self) -> ResultName | None:
         """The name this step saves a result under, if it retrieves one."""
         return None
+
+    @property
+    def result_names(self) -> tuple[ResultName, ...]:
+        return () if self.result_name is None else (self.result_name,)
 
     @property
     def results_read(self) -> tuple[ResultName, ...]:
@@ -131,7 +158,7 @@ class Step(ABC):
     @property
     def _timeout(self) -> _TimeoutArg:
         """``timeout`` as keyword args, left out when unset."""
-        return {} if self.timeout is None else {"timeout": self.timeout}
+        return _timeout_arg(self.timeout)
 
     @abstractmethod
     async def run(self, ctx: ActionContext) -> None: ...
@@ -140,14 +167,25 @@ class Step(ABC):
 async def run_steps(steps: Iterable[Step], ctx: ActionContext) -> None:
     """Run steps in order, skipping an ``optional`` one that times out."""
     for step in steps:
-        if not step.optional:
-            await step.run(ctx)
-            continue
         try:
-            await step.run(ctx)
-        except ctx.timeout_errors:
+            if step.total_timeout and step.timeout:
+                expires = get_running_loop().time() + step.timeout / 1000
+                inherited = _DEADLINE.get()
+                if inherited is not None:
+                    expires = min(expires, inherited)
+                token = _DEADLINE.set(expires)
+                try:
+                    async with deadline(max(0, expires - get_running_loop().time())):
+                        await step.run(ctx)
+                finally:
+                    _DEADLINE.reset(token)
+            else:
+                await step.run(ctx)
+        except (TimeoutError, *ctx.timeout_errors):
+            if not step.optional:
+                raise
             # Still save the name, so callers can rely on the key being there.
-            if (name := step.result_name) is not None:
+            for name in step.result_names:
                 ctx.results[name] = None
 
 
@@ -217,11 +255,12 @@ class TextStep(TargetResultStep):
 
     @classmethod
     def parse(cls, value: RawYaml, params: ParamNames) -> Self:
-        step = super().parse(value, params)
-        exclude: RawYaml = value.get("exclude") if isinstance(value, dict) else None
-        if exclude is None:
-            return step
-        return replace(step, exclude=_selector_key(exclude, cls.kind))
+        target, (result, exclude) = _target_mapping(value, cls.kind, "as", "exclude")
+        return cls(
+            target,
+            _result_name(result, cls.kind),
+            None if exclude is None else _selector_key(exclude, cls.kind),
+        )
 
     @property
     def selector_keys(self) -> tuple[SelectorKey, ...]:
@@ -245,7 +284,7 @@ class Goto(Step, kind="goto"):
 
     async def run(self, ctx: ActionContext) -> None:
         await ctx.page.goto(
-            fill(self.url, ctx.params),
+            fill(self.url, ctx.params, ctx.results),
             wait_until="domcontentloaded",
             **self._timeout,
         )
@@ -265,7 +304,7 @@ class WaitForUrl(Step, kind="wait_for_url"):
 
     async def run(self, ctx: ActionContext) -> None:
         await ctx.page.wait_for_url(
-            fill(self.url, ctx.params),
+            fill(self.url, ctx.params, ctx.results),
             wait_until="domcontentloaded",
             **self._timeout,
         )
@@ -279,7 +318,7 @@ class Wait(Step, kind="wait"):
 
     @classmethod
     def parse(cls, value: RawYaml, params: ParamNames) -> Self:
-        return cls(_milliseconds(value, cls.kind))
+        return cls(_milliseconds(_unwrap(value, "ms"), cls.kind))
 
     async def run(self, ctx: ActionContext) -> None:
         await ctx.page.wait_for_timeout(self.ms)
@@ -355,7 +394,7 @@ class WaitFor(TargetStep, kind="wait_for"):
 class Fill(TargetValueStep, kind="fill"):
     async def run(self, ctx: ActionContext) -> None:
         await ctx.page.locator(ctx.sel[self.target]).fill(
-            fill(self.value, ctx.params), **self._timeout
+            fill(self.value, ctx.params, ctx.results), **self._timeout
         )
 
 
@@ -363,7 +402,7 @@ class Fill(TargetValueStep, kind="fill"):
 class Select(TargetValueStep, kind="select"):
     async def run(self, ctx: ActionContext) -> None:
         await ctx.page.locator(ctx.sel[self.target]).select_option(
-            fill(self.value, ctx.params), **self._timeout
+            fill(self.value, ctx.params, ctx.results), **self._timeout
         )
 
 
@@ -398,7 +437,7 @@ class Press(Step, kind="press"):
         return (self.key,)
 
     async def run(self, ctx: ActionContext) -> None:
-        key = fill(self.key, ctx.params)
+        key = fill(self.key, ctx.params, ctx.results)
         if self.target is None:
             await ctx.page.keyboard.press(key)
             return
@@ -425,12 +464,18 @@ class UploadFile:
     def templates(self) -> tuple[Template, ...]:
         return tuple(t for t in (self.path, self.name, self.mime_type) if t is not None)
 
-    async def payload(self, params: ParamValues) -> FilePayload:
-        name = None if self.name is None else fill(self.name, params)
-        mime_type = None if self.mime_type is None else fill(self.mime_type, params)
+    async def payload(
+        self, params: ParamValues, results: Results | None = None
+    ) -> FilePayload:
+        name = None if self.name is None else fill(self.name, params, results)
+        mime_type = (
+            None if self.mime_type is None else fill(self.mime_type, params, results)
+        )
         if self.data is None:
             assert self.path is not None
-            return await _read_payload(Path(fill(self.path, params)), name, mime_type)
+            return await _read_payload(
+                Path(fill(self.path, params, results)), name, mime_type
+            )
         value = params[self.data]
         assert not isinstance(value, list)
         buffer = value if isinstance(value, bytes) else value.encode()
@@ -462,6 +507,7 @@ class Upload(Step, kind="upload"):
     files: tuple[UploadEntry, ...]
     click: SelectorKey | None = None
     steps: tuple[Step, ...] = ()
+    total_timeout = True
 
     @classmethod
     def parse(cls, value: RawYaml, params: ParamNames) -> Self:
@@ -512,7 +558,7 @@ class Upload(Step, kind="upload"):
 
     async def run(self, ctx: ActionContext) -> None:
         # Read everything first, so a missing file fails before the page is touched.
-        files = await self._files(ctx.params)
+        files = await self._files(ctx.params, ctx.results)
         if self.target is not None:
             locator = ctx.page.locator(ctx.sel[self.target])
             await locator.set_input_files(files, **self._timeout)
@@ -520,19 +566,25 @@ class Upload(Step, kind="upload"):
         async with ctx.page.expect_file_chooser(**self._timeout) as info:
             await _start_event(ctx, self.click, self.steps)
         chooser = await info.value
-        await chooser.set_files(files)
+        await chooser.set_files(files, **_timeout_arg())
 
-    async def _files(self, params: ParamValues) -> list[str] | list[FilePayload]:
+    async def _files(
+        self, params: ParamValues, results: Results | None = None
+    ) -> list[str] | list[FilePayload]:
         entries: list[str | FilePayload] = []
         for file in self.files:
             if isinstance(file, str):
-                entries.append(fill(file, params))
+                entries.append(fill(file, params, results))
             elif isinstance(file, UploadFile):
-                entries.append(await file.payload(params))
+                entries.append(await file.payload(params, results))
             else:
                 entries.extend(_param_files(params[file.param]))
         paths = [entry for entry in entries if isinstance(entry, str)]
         if len(paths) == len(entries):
+            # Preserve path-based streaming, but check files before the trigger.
+            for path in paths:
+                async with aiofiles.open(path, "rb") as source:
+                    await source.read(1)
             return paths
         # Paths and payloads can't be mixed in one call, so plain paths are read
         # into payloads too, keeping their own names.
@@ -548,13 +600,15 @@ class Download(Step, kind="download"):
 
     ``to`` is a file path, or a directory (existing, or written with a trailing
     slash) to save into under the browser's suggested filename. ``timeout``
-    bounds the wait for the download to start.
+    bounds the entire step, including its trigger and saving the file.
     """
 
     target: SelectorKey | None
     to: PathTemplate
     result: ResultName | None = None
     steps: tuple[Step, ...] = ()
+    total_timeout = True
+    reads_after_branches = True
 
     @classmethod
     def parse(cls, value: RawYaml, params: ParamNames) -> Self:
@@ -591,7 +645,7 @@ class Download(Step, kind="download"):
             await _start_event(ctx, self.target, self.steps)
         download = await info.value
 
-        to = fill(self.to, ctx.params)
+        to = fill(self.to, ctx.params, ctx.results)
         path = Path(to)
         if to.endswith(("/", os.sep)) or path.is_dir():
             # Keep only the name, in case a page suggests one with a path in it.
@@ -606,7 +660,7 @@ async def _start_event(
 ) -> None:
     """Do what makes the page fire a file event: click ``click``, or run ``steps``."""
     if click is not None:
-        await ctx.page.locator(ctx.sel[click]).click()
+        await ctx.page.locator(ctx.sel[click]).click(**_timeout_arg())
     else:
         await run_steps(steps, ctx)
 
@@ -658,7 +712,8 @@ const textOf = (root, exclude) => {
   const parts = [];
   const visit = (node) => {
     if (node.nodeType === Node.TEXT_NODE) {
-      parts.push(node.data);
+      const visibility = getComputedStyle(node.parentElement).visibility;
+      if (visibility !== "hidden" && visibility !== "collapse") parts.push(node.data);
       return;
     }
     if (node.nodeType !== Node.ELEMENT_NODE || node.matches(exclude)) return;
@@ -693,11 +748,14 @@ class GetText(TextStep, kind="get_text"):
 
 @dataclass(frozen=True)
 class GetAllTexts(TextStep, kind="get_all_texts"):
-    # Reads whatever matches right now, without waiting for anything.
-    takes_timeout = False
+    # Keep snapshot behavior by default; an explicit timeout waits for a match.
+    total_timeout = True
 
     async def run(self, ctx: ActionContext) -> None:
         locator = ctx.page.locator(ctx.sel[self.target])
+        if self.timeout is not None:
+            while await locator.count() == 0:
+                await sleep(0.025)
         if self.exclude is None:
             ctx.results[self.result] = await locator.all_inner_texts()
             return
@@ -748,7 +806,7 @@ class ElementIs:
                 return await locator.count() > 0
             return await locator.is_visible() == (self.state == "visible")
         try:
-            await locator.wait_for(state=self.state, timeout=self.timeout)
+            await locator.wait_for(state=self.state, **_timeout_arg(self.timeout))
         except ctx.timeout_errors:
             return False
         return True
@@ -772,7 +830,7 @@ class ParamEquals:
     value: Template
 
     async def holds(self, ctx: ActionContext) -> bool:
-        return ctx.params[self.param] == fill(self.value, ctx.params)
+        return ctx.params[self.param] == fill(self.value, ctx.params, ctx.results)
 
 
 @dataclass(frozen=True)
@@ -795,7 +853,7 @@ class ResultEquals:
     value: Template
 
     async def holds(self, ctx: ActionContext) -> bool:
-        return ctx.results.get(self.result) == fill(self.value, ctx.params)
+        return ctx.results.get(self.result) == fill(self.value, ctx.params, ctx.results)
 
 
 @dataclass(frozen=True)
@@ -806,17 +864,48 @@ class UrlIs:
     url: UrlTemplate
 
     async def holds(self, ctx: ActionContext) -> bool:
-        return _glob(fill(self.url, ctx.params)).fullmatch(ctx.page.url) is not None
+        return (
+            _glob(fill(self.url, ctx.params, ctx.results)).fullmatch(ctx.page.url)
+            is not None
+        )
 
 
 def _glob(glob: str) -> re.Pattern[str]:
-    parts = re.split(r"(\*\*|\*)", glob)
-    return re.compile(
-        "".join(
-            ".*" if part == "**" else "[^/]*" if part == "*" else re.escape(part)
-            for part in parts
-        )
-    )
+    # Match Playwright's URL glob semantics, without requiring Playwright.
+    tokens: list[str] = []
+    group = False
+    i = 0
+    while i < len(glob):
+        char = glob[i]
+        if char == "\\" and i + 1 < len(glob):
+            i += 1
+            tokens.append(re.escape(glob[i]))
+        elif char == "*":
+            start = i
+            while i + 1 < len(glob) and glob[i + 1] == "*":
+                i += 1
+            if i > start:
+                if i + 1 < len(glob) and glob[i + 1] == "/":
+                    tokens.append(
+                        "(?:.+/)?" if start > 0 and glob[start - 1] == "/" else ".*/"
+                    )
+                    i += 1
+                else:
+                    tokens.append(".*")
+            else:
+                tokens.append("[^/]*")
+        elif char == "{":
+            group = True
+            tokens.append("(")
+        elif char == "}":
+            group = False
+            tokens.append(")")
+        elif char == "," and group:
+            tokens.append("|")
+        else:
+            tokens.append(re.escape(char))
+        i += 1
+    return re.compile("".join(tokens))
 
 
 type Condition = (
@@ -903,7 +992,7 @@ class Fail(Step, kind="fail"):
         return (self.message,)
 
     async def run(self, ctx: ActionContext) -> None:
-        raise ActionFailed(fill(self.message, ctx.params), ctx.results)
+        raise ActionFailed(fill(self.message, ctx.params, ctx.results), ctx.results)
 
 
 @dataclass(frozen=True)
@@ -913,20 +1002,237 @@ class Call(Step, kind="call"):
     takes_timeout = False
 
     hook: HookName
+    result: ResultName | None = None
+    outputs: tuple[ResultName, ...] = ()
 
     @classmethod
     def parse(cls, value: RawYaml, params: ParamNames) -> Self:
-        hook = _string(_unwrap(value, "hook"), cls.kind)
+        if isinstance(value, dict):
+            _mapping_keys(value, {"hook", "as", "results"}, cls.kind)
+            hook = _string(value.get("hook"), cls.kind)
+            result = None if "as" not in value else _result_name(value["as"], cls.kind)
+            raw = value.get("results", [])
+            if not isinstance(raw, list):
+                raise BadActionFile(
+                    "Step 'call' results must be a list of result names."
+                )
+            outputs = tuple(_result_name(name, cls.kind) for name in raw)
+            names = (*outputs, *((result,) if result is not None else ()))
+            if len(set(names)) != len(names):
+                raise BadActionFile("Step 'call' has duplicate result names.")
+        else:
+            hook, result, outputs = _string(value, cls.kind), None, ()
         if not hook:
             raise BadActionFile(f"Step {cls.kind!r} needs a non-empty hook name.")
-        return cls(hook)
+        return cls(hook, result, outputs)
+
+    @property
+    def result_name(self) -> ResultName | None:
+        return self.result
+
+    @property
+    def result_names(self) -> tuple[ResultName, ...]:
+        return (*self.outputs, *super().result_names)
 
     @property
     def hook_name(self) -> HookName:
         return self.hook
 
     async def run(self, ctx: ActionContext) -> None:
-        await ctx.hooks[self.hook](ctx)
+        value = await ctx.hooks[self.hook](ctx)
+        if self.result is not None:
+            if not is_result_value(value):
+                raise BadResultValue(
+                    self.result, value, "a string, list of strings or None"
+                )
+            ctx.results[self.result] = value
+        for name in self.outputs:
+            ctx.results.setdefault(name, None)
+            if not is_result_value(ctx.results[name]):
+                raise BadResultValue(
+                    name, ctx.results[name], "a string, list of strings or None"
+                )
+
+
+@dataclass(frozen=True)
+class RunAction(Step, kind="run"):
+    """Call another loaded action under the current run's lock."""
+
+    action: str
+    values: dict[str, Template] = field(default_factory=dict)
+    outputs: dict[str, ResultName] = field(default_factory=dict)
+    total_timeout = True
+
+    @classmethod
+    def parse(cls, value: RawYaml, params: ParamNames) -> Self:
+        if isinstance(value, str):
+            return cls(value)
+        if not isinstance(value, dict):
+            raise BadActionFile("Step 'run' needs an action name or mapping.")
+        _mapping_keys(value, {"action", "params", "results"}, cls.kind)
+        action = _string(value.get("action"), cls.kind)
+        values, outputs = value.get("params", {}), value.get("results", {})
+        if not isinstance(values, dict) or not all(isinstance(k, str) for k in values):
+            raise BadActionFile(
+                "Step 'run' params must be a mapping of names to templates."
+            )
+        if not isinstance(outputs, dict) or not all(
+            isinstance(k, str) for k in outputs
+        ):
+            raise BadActionFile(
+                "Step 'run' results must map child result names to output names."
+            )
+        parsed = {
+            _result_name(k, cls.kind): _result_name(v, cls.kind)
+            for k, v in outputs.items()
+        }
+        if len(set(parsed.values())) != len(parsed):
+            raise BadActionFile("Step 'run' has duplicate output names.")
+        return cls(
+            action,
+            {k: _template(v, params, cls.kind) for k, v in values.items()},
+            parsed,
+        )
+
+    @property
+    def templates(self) -> tuple[Template, ...]:
+        return tuple(self.values.values())
+
+    @property
+    def result_names(self) -> tuple[ResultName, ...]:
+        return tuple(self.outputs.values())
+
+    async def run(self, ctx: ActionContext) -> None:
+        if ctx.run_action is None:
+            raise BadActionFile("Step 'run' requires a WebPage action runner.")
+        values = {k: fill(v, ctx.params, ctx.results) for k, v in self.values.items()}
+        results = await ctx.run_action(self.action, values)
+        for child, output in self.outputs.items():
+            ctx.results[output] = results.get(child)
+
+
+@dataclass(frozen=True)
+class Repeat(Step, kind="repeat"):
+    """Repeat a bounded number of times; an optional until condition polls."""
+
+    times: int
+    steps: tuple[Step, ...]
+    until: Condition | None = None
+    interval: Milliseconds = 0
+    total_timeout = True
+    reads_after_branches = True
+    _local_results: frozenset[ResultName] = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "_local_results",
+            frozenset(name for step in walk(self.steps) for name in step.result_names),
+        )
+
+    @classmethod
+    def parse(cls, value: RawYaml, params: ParamNames) -> Self:
+        if not isinstance(value, dict):
+            raise BadActionFile("Step 'repeat' needs a mapping.")
+        _mapping_keys(value, {"times", "steps", "until", "interval"}, cls.kind)
+        condition = value.get("until")
+        if condition is not None:
+            if (
+                not isinstance(condition, dict)
+                or len(condition) != 1
+                or next(iter(condition)) not in _CONDITIONS
+            ):
+                raise BadActionFile("Step 'repeat' until needs exactly one condition.")
+            key, raw = next(iter(condition.items()))
+            condition = _condition(key, raw, params, cls.kind)
+        return cls(
+            _positive_integer(value.get("times"), cls.kind),
+            parse_step_list(value.get("steps"), params),
+            condition,
+            _milliseconds(value.get("interval", 0), cls.kind),
+        )
+
+    @property
+    def branches(self) -> tuple[tuple[Step, ...], ...]:
+        return (self.steps,)
+
+    @property
+    def selector_keys(self) -> tuple[SelectorKey, ...]:
+        return (self.until.target,) if isinstance(self.until, ElementIs) else ()
+
+    @property
+    def templates(self) -> tuple[Template, ...]:
+        if isinstance(self.until, ParamEquals | ResultEquals):
+            return (self.until.value,)
+        return (self.until.url,) if isinstance(self.until, UrlIs) else ()
+
+    @property
+    def results_read(self) -> tuple[ResultName, ...]:
+        return (
+            (self.until.result,)
+            if isinstance(self.until, ResultIsSet | ResultEquals)
+            else ()
+        )
+
+    async def run(self, ctx: ActionContext) -> None:
+        for index in range(self.times):
+            for name in self._local_results:
+                ctx.results.pop(name, None)
+            await run_steps(self.steps, ctx)
+            if self.until is not None and await self.until.holds(ctx):
+                return
+            if index + 1 < self.times and self.interval:
+                await sleep(self.interval / 1000)
+        if self.until is not None:
+            raise ActionFailed(
+                f"Repeat condition was not met after {self.times} iterations.",
+                ctx.results,
+            )
+
+
+@dataclass(frozen=True)
+class Retry(Step, kind="retry"):
+    attempts: int
+    steps: tuple[Step, ...]
+    interval: Milliseconds = 0
+    total_timeout = True
+
+    @classmethod
+    def parse(cls, value: RawYaml, params: ParamNames) -> Self:
+        if not isinstance(value, dict):
+            raise BadActionFile("Step 'retry' needs a mapping.")
+        _mapping_keys(value, {"attempts", "steps", "interval"}, cls.kind)
+        return cls(
+            _positive_integer(value.get("attempts"), cls.kind),
+            parse_step_list(value.get("steps"), params),
+            _milliseconds(value.get("interval", 0), cls.kind),
+        )
+
+    @property
+    def branches(self) -> tuple[tuple[Step, ...], ...]:
+        return (self.steps,)
+
+    async def run(self, ctx: ActionContext) -> None:
+        before = dict(ctx.results)
+        for attempt in range(self.attempts):
+            ctx.results.clear()
+            ctx.results.update(before)
+            try:
+                await run_steps(self.steps, ctx)
+                return
+            except (TimeoutError, ActionFailed, *ctx.timeout_errors):
+                if attempt + 1 == self.attempts:
+                    raise
+                if self.interval:
+                    await sleep(self.interval / 1000)
+
+
+def _positive_integer(value: RawYaml, kind: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise BadActionFile(
+            f"Step {kind!r} needs a positive integer count, not {value!r}."
+        )
+    return value
 
 
 def _condition(
@@ -973,7 +1279,7 @@ def _selector_key(value: RawYaml, kind: StepKind) -> SelectorKey:
 def _template(value: RawYaml, params: ParamNames, kind: StepKind) -> Template:
     template = _string(value, kind)
     check_placeholders(template, params, kind)
-    return template
+    return prepare_template(template)
 
 
 def _choice[T: str](
@@ -1059,6 +1365,9 @@ def _event_source(
     """Check a file step has ``required`` and exactly one of ``sources``, and
     return its ``target``, ``click`` and ``steps`` (unset ones as None or ())."""
     if isinstance(value, dict) and required in value:
+        _mapping_keys(
+            value, {*sources, required, *(("as",) if kind == "download" else ())}, kind
+        )
         given = [key for key in sources if key in value]
         if len(given) == 1:
             (key,) = given
@@ -1080,6 +1389,7 @@ def _target_mapping(
 ) -> tuple[SelectorKey, tuple[RawYaml, ...]]:
     """Split ``{target: <key>, <field>: ...}``; the caller checks the field values."""
     if isinstance(value, dict):
+        _mapping_keys(value, {"target", *fields}, kind)
         target: RawYaml = value.get("target")
         if isinstance(target, str):
             return target, tuple(value.get(f) for f in fields)
@@ -1088,6 +1398,13 @@ def _target_mapping(
         f"Step {kind!r} needs a mapping with string {', '.join(map(repr, first))} "
         f"and {last!r} keys, not {value!r}."
     )
+
+
+def _mapping_keys(value: dict, allowed: set[str], kind: str) -> None:
+    if unknown := value.keys() - allowed:
+        raise BadActionFile(
+            f"Step {kind!r} has unknown fields {sorted(map(str, unknown))}."
+        )
 
 
 def _result_name(value: RawYaml, kind: StepKind) -> ResultName:
@@ -1153,30 +1470,44 @@ def parse_step_list(raw: RawYaml, params: ParamNames) -> tuple[Step, ...]:
     return tuple(steps)
 
 
-def _check_results(steps: Iterable[Step], taken: set[ResultName]) -> None:
+def _check_results(
+    steps: Iterable[Step],
+    taken: set[ResultName],
+    selectors: dict[str, str] | None = None,
+) -> None:
     """Reject a result name saved twice, since the later one would overwrite the
     earlier, and one read before any step saves it. Alternative branches may
     share a name: only one of them runs."""
     for step in steps:
-        for read in step.results_read:
-            if read not in taken:
-                raise BadActionFile(
-                    f"Step {step.kind!r} reads result {read!r}, which no earlier "
-                    f"step saves."
-                )
-        if (result := step.result_name) is not None:
-            if result in taken:
-                raise BadActionFile(
-                    f"Step {step.kind!r} saves result {result!r}, which an earlier "
-                    f"step already saves."
-                )
-            taken.add(result)
+        reads = set(step.results_read)
+        for template in step.templates:
+            reads |= result_placeholders(template)
+        if selectors is not None:
+            for key in step.selector_keys:
+                reads |= result_placeholders(selectors[key])
+        if not step.reads_after_branches:
+            _require_results(reads, taken, step.kind)
         in_branches: set[ResultName] = set()
         for branch in step.branches:
             seen = set(taken)
-            _check_results(branch, seen)
+            _check_results(branch, seen, selectors)
             in_branches |= seen
         taken |= in_branches
+        if step.reads_after_branches:
+            _require_results(reads, taken, step.kind)
+        for result in step.result_names:
+            if result in taken:
+                raise BadActionFile(
+                    f"Step {step.kind!r} saves result {result!r}, which an earlier step already saves."
+                )
+            taken.add(result)
+
+
+def _require_results(reads: set[str], taken: set[str], kind: str) -> None:
+    for read in sorted(reads - taken):
+        raise BadActionFile(
+            f"Step {kind!r} reads result {read!r}, which no earlier step saves."
+        )
 
 
 def parse_steps(raw: RawYaml, params: ParamNames) -> tuple[Step, ...]:

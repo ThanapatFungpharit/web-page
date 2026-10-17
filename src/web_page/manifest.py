@@ -1,7 +1,9 @@
 from pathlib import Path
 
 import aiofiles
-from yaml import YAMLError, safe_load
+from yaml import SafeLoader, YAMLError, load
+from yaml.constructor import ConstructorError
+from yaml.nodes import MappingNode
 
 from web_page.constants import YAML_SUFFIXES
 from web_page.types import (
@@ -14,6 +16,46 @@ from web_page.types import (
     RawYaml,
 )
 from web_page.utils import is_str_list
+
+
+class _ManifestLoader(SafeLoader):
+    def __init__(self, stream) -> None:
+        super().__init__(stream)
+        self._checked_mappings: set[MappingNode] = set()
+
+    def flatten_mapping(self, node: MappingNode) -> None:
+        if node not in self._checked_mappings:
+            self._checked_mappings.add(node)
+            seen = set()
+            merge_seen = False
+            # Check explicit keys before flattening YAML merge keys. Overrides of
+            # inherited values remain legal; duplicate keys written here do not.
+            for key_node, _ in node.value:
+                if key_node.tag == "tag:yaml.org,2002:merge":
+                    if merge_seen:
+                        raise ConstructorError(
+                            None, None, "duplicate key '<<'", key_node.start_mark
+                        )
+                    merge_seen = True
+                    continue
+                key = self.construct_object(key_node)
+                try:
+                    duplicate = key in seen
+                    seen.add(key)
+                except TypeError as e:
+                    raise ConstructorError(
+                        None, None, "unhashable mapping key", key_node.start_mark
+                    ) from e
+                if duplicate:
+                    raise ConstructorError(
+                        None, None, f"duplicate key {key!r}", key_node.start_mark
+                    )
+        super().flatten_mapping(node)
+
+
+def check_keys(manifest: RawManifest, allowed: set[str], error: ManifestError) -> None:
+    if unknown := manifest.keys() - allowed:
+        raise error(f"Unknown manifest fields: {sorted(map(str, unknown))}.")
 
 
 async def read_manifest(
@@ -31,7 +73,7 @@ async def read_manifest(
     async with aiofiles.open(path, encoding="utf-8") as f:
         content = await f.read()
     try:
-        manifest: RawYaml = safe_load(content)
+        manifest: RawYaml = load(content, Loader=_ManifestLoader)
     except YAMLError as e:
         raise error(f"{kind} manifest ({path}) is not valid YAML: {e}") from e
     if not isinstance(manifest, dict):

@@ -1,15 +1,19 @@
 import re
 import string
-from collections.abc import Callable
+from collections.abc import Callable, Iterator, Mapping
+from dataclasses import dataclass
+from functools import lru_cache
 from typing import TypeIs
 
-from web_page.exceptions import BadActionFile
+from web_page.exceptions import BadActionFile, BadResultValue
 from web_page.protocols import FilePayload
 from web_page.types import (
     ParamName,
     ParamNames,
     ParamValues,
     RawYaml,
+    Results,
+    ResultValue,
     StepKind,
     Template,
 )
@@ -36,6 +40,10 @@ def is_file_payload(value: object) -> TypeIs[FilePayload]:
     )
 
 
+def is_result_value(value: object) -> TypeIs[ResultValue]:
+    return value is None or isinstance(value, str) or is_str_list(value)
+
+
 def check_placeholders(template: Template, params: ParamNames, step: StepKind) -> None:
     try:
         unknown = placeholders(template) - set(params)
@@ -51,10 +59,55 @@ def check_placeholders(template: Template, params: ParamNames, step: StepKind) -
 
 # Templates: the one definition of what a template may contain, and how it is
 # filled in, shared by step values and selectors.
-def placeholders(template: Template) -> set[ParamName]:
-    """The param names a template uses.
+@dataclass(frozen=True, slots=True)
+class _CompiledTemplate:
+    # Store syntax only. Params and saved results can change between accesses.
+    parts: tuple[tuple[str, str | None, str, bool], ...]
+    params: frozenset[str]
+    results: frozenset[str]
+    literal: str | None
 
-    Only plain ``{name}`` placeholders are allowed, optionally with an escape
+    def render(self, params: ParamValues, results: Results | None = None) -> str:
+        if self.literal is not None:
+            return self.literal
+        out: list[str] = []
+        for literal, name, escape, is_result in self.parts:
+            out.append(literal)
+            if name is None:
+                continue
+            if is_result:
+                value = None if results is None else results.get(name)
+                if not isinstance(value, str):
+                    raise BadResultValue(name, value)
+                text = value
+            else:
+                text = str(params[name])
+            out.append(ESCAPES[escape](text) if escape else text)
+        return "".join(out)
+
+
+class _PreparedTemplate(str):
+    """A string-compatible template that owns its compiled syntax for its lifetime."""
+
+    __slots__ = ("compiled",)
+    compiled: _CompiledTemplate
+
+    def __new__(cls, template: str, compiled: _CompiledTemplate):
+        instance = super().__new__(cls, template)
+        instance.compiled = compiled
+        return instance
+
+    def __getnewargs_ex__(
+        self,
+    ) -> tuple[tuple[str, _CompiledTemplate], dict[str, object]]:
+        return (str(self), self.compiled), {}
+
+
+@lru_cache(maxsize=1024)
+def _compile_template(template: Template) -> _CompiledTemplate:
+    """The parameter and saved-result names a template uses.
+
+    Plain ``{name}`` and ``{result.name}`` placeholders are allowed, optionally with an escape
     from ``ESCAPES`` as in ``{name:css}``, plus ``{{`` and ``}}`` for literal
     braces. ``str.format`` extras, such as ``{}``, ``{0}``,
     ``{name.attr}``, ``{name[0]}``, ``{name!r}`` and ``{name:>8}``, raise
@@ -62,8 +115,11 @@ def placeholders(template: Template) -> set[ParamName]:
     produce something odd, when the action runs.
     """
     names: set[ParamName] = set()
-    for _, field, spec, conversion in string.Formatter().parse(template):
+    results: set[str] = set()
+    parts: list[tuple[str, str | None, str, bool]] = []
+    for literal, field, spec, conversion in string.Formatter().parse(template):
         if field is None:
+            parts.append((literal, None, "", False))
             continue
         written = (
             "{"
@@ -74,7 +130,15 @@ def placeholders(template: Template) -> set[ParamName]:
         )
         if not field or field.isdigit():
             raise ValueError(f"{written} needs a param name, as in {{name}}")
-        if conversion is not None or "." in field or "[" in field:
+        result = field.removeprefix("result.") if field.startswith("result.") else None
+        plain = field if result is None else result
+        if (
+            conversion is not None
+            or not plain
+            or "." in plain
+            or "[" in plain
+            or "]" in plain
+        ):
             raise ValueError(
                 f"{written} is not a plain {{name}} placeholder; "
                 f"formatting, attributes and indexes are not supported"
@@ -84,19 +148,74 @@ def placeholders(template: Template) -> set[ParamName]:
                 f"{written} is not a plain {{name}} placeholder; the only "
                 f"formats are the escapes {sorted(ESCAPES)}, as in {{{field}:css}}"
             )
-        names.add(field)
-    return names
+        (names if result is None else results).add(plain)
+        parts.append((literal, plain, spec or "", result is not None))
+    return _CompiledTemplate(
+        tuple(parts),
+        frozenset(names),
+        frozenset(results),
+        "".join(part[0] for part in parts) if not names and not results else None,
+    )
 
 
-class _Filler(string.Formatter):
-    def format_field(self, value: object, format_spec: str) -> str:
-        text = str(value)
-        return ESCAPES[format_spec](text) if format_spec else text
+def placeholders(template: Template) -> set[ParamName]:
+    # Return fresh sets so callers cannot mutate the shared compiled template.
+    return set(compiled_template(template).params)
 
 
-def fill(template: Template, params: ParamValues) -> str:
+def result_placeholders(template: Template) -> set[str]:
+    return set(compiled_template(template).results)
+
+
+def compiled_template(template: Template) -> _CompiledTemplate:
+    if isinstance(template, _PreparedTemplate):
+        return template.compiled
+    return _compile_template(template)
+
+
+def prepare_template(template: Template) -> Template:
+    """Bind syntax at load time, preserving string equality and the template API."""
+    if isinstance(template, _PreparedTemplate):
+        return template
+    return _PreparedTemplate(template, _compile_template(template))
+
+
+def fill(
+    template: Template, params: ParamValues, results: Results | None = None
+) -> str:
     """Fill a template's placeholders in with params, checked beforehand."""
-    return _Filler().vformat(template, (), params)
+    if isinstance(template, _PreparedTemplate):
+        return template.compiled.render(params, results)
+    if "{" not in template and "}" not in template:
+        return template
+    return _compile_template(template).render(params, results)
+
+
+class SelectorTemplates(Mapping[str, str]):
+    """Resolve selectors when used, so earlier results can select later elements."""
+
+    def __init__(self, raw: Mapping[str, str], params: ParamValues, results: Results):
+        self.raw, self.params, self.results = raw, params, results
+
+    def __getitem__(self, key: str) -> str:
+        compiled = compiled_template(self.raw[key])
+        if not all(isinstance(self.params.get(p), str) for p in compiled.params):
+            raise KeyError(key)
+        return compiled.render(self.params, self.results)
+
+    def __contains__(self, key: object) -> bool:
+        if not isinstance(key, str) or key not in self.raw:
+            return False
+        compiled = compiled_template(self.raw[key])
+        return all(
+            isinstance(self.params.get(p), str) for p in compiled.params
+        ) and all(isinstance(self.results.get(r), str) for r in compiled.results)
+
+    def __iter__(self) -> Iterator[str]:
+        return (key for key in self.raw if key in self)
+
+    def __len__(self) -> int:
+        return sum(1 for _ in self)
 
 
 # Escapes: ``{name:<escape>}`` inserts the value so that it matches itself
@@ -123,7 +242,22 @@ def _css_identifier(value: str) -> str:
 
 
 def _quoted_string(value: str) -> str:
-    """For inside quotes: a CSS string, or a Playwright ``[name='…']``."""
+    """For a CSS quoted string, including control characters."""
+    escaped: list[str] = []
+    for char in value:
+        if char == "\0":
+            escaped.append("�")
+        elif ord(char) < 32 or ord(char) == 127:
+            escaped.append(f"\\{ord(char):x} ")
+        elif char in "\\\"'":
+            escaped.append("\\" + char)
+        else:
+            escaped.append(char)
+    return "".join(escaped)
+
+
+def _role_string(value: str) -> str:
+    # Playwright's role parser unescapes the next character, not CSS hex escapes.
     return re.sub(r"""[\\'"]""", r"\\\g<0>", value)
 
 
@@ -135,5 +269,6 @@ def _regex(value: str) -> str:
 ESCAPES: dict[str, Callable[[str], str]] = {
     "css": _css_identifier,
     "string": _quoted_string,
+    "role": _role_string,
     "regex": _regex,
 }
